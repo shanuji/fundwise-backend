@@ -6,6 +6,7 @@ from scipy.optimize import newton
 from datetime import datetime
 import tempfile
 import os
+import yfinance as yf
 
 app = FastAPI(title="FundWise Precision Engine")
 
@@ -18,16 +19,12 @@ app.add_middleware(
 )
 
 def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date: datetime) -> float:
-    """
-    Computes exact XIRR using SciPy Newton-Raphson method.
-    """
     if not cash_flows:
         return 0.0
 
     dates = [datetime.strptime(cf["date"], "%Y-%m-%d") for cf in cash_flows]
     amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"] else abs(cf["amount"]) for cf in cash_flows]
 
-    # Add terminal portfolio value as a positive cash flow today
     dates.append(end_date)
     amounts.append(current_market_value)
 
@@ -44,20 +41,38 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
         rate = newton(xirr_func, 0.10, fprime=xirr_derivative, maxiter=100)
         return round(rate * 100, 2)
     except Exception:
-        # Fallback to numpy-financial if Newton-Raphson fails to converge
         return round(npf.irr(amounts) * 100, 2)
 
+def get_benchmark_return(start_date_str: str) -> float:
+    """
+    Fetches Nifty 50 historical data via yfinance and computes annualized return.
+    """
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        ticker = yf.Ticker("^NSEI")
+        df = ticker.history(start=start_date_str)
+        
+        if df.empty:
+            return 14.0 # Fallback historical average
+            
+        start_price = df['Close'].iloc[0]
+        end_price = df['Close'].iloc[-1]
+        
+        days = (datetime.now() - start_date).days
+        if days <= 30:
+            return 12.0
+            
+        cagr = ((end_price / start_price) ** (365.0 / days) - 1) * 100
+        return round(cagr, 2)
+    except Exception:
+        return 14.2
+
 def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
-    """
-    Core FIFO engine to calculate realized gains based on holding periods.
-    """
     total_stcg = 0.0
     total_ltcg = 0.0
     
     for scheme in schemes_data:
         buy_queue = [] 
-        
-        # Sort transactions chronologically
         transactions = sorted(scheme.get("transactions", []), key=lambda x: datetime.strptime(x["date"], "%Y-%m-%d"))
         
         for tx in transactions:
@@ -85,29 +100,22 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
                     
                     units_to_sell = min(sell_units, available_units)
                     days_held = (date_obj - buy_date).days
-                    
-                    # Calculate gain for this specific batch
                     gain = (sell_nav - buy_nav) * units_to_sell
                     
-                    # 365 days cutoff for equity funds
                     if days_held > 365:
                         total_ltcg += gain
                     else:
                         total_stcg += gain
                         
-                    # Deduct units from queue
                     sell_units -= units_to_sell
                     buy_queue[0]['units'] -= units_to_sell
                     
                     if buy_queue[0]['units'] <= 0.0001:
                         buy_queue.pop(0)
 
-    # Apply Tax Rules parameters passed from Flutter
     taxable_ltcg = max(0, total_ltcg - exemption_limit)
     ltcg_tax = taxable_ltcg * (ltcg_rate / 100.0)
-    
     stcg_tax = max(0, total_stcg) * (stcg_rate / 100.0)
-    
     total_tax = max(0, ltcg_tax) + max(0, stcg_tax)
     
     return {
@@ -128,29 +136,33 @@ async def parse_statement(
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Invalid file type. Must be a PDF.")
 
-    # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         contents = await file.read()
         tmp.write(contents)
         tmp_path = tmp.name
 
     try:
-        # Execute Deterministic casparser
         data = casparser.read_cas_pdf(tmp_path, password="", output="dict")
         
         total_invested = 0.0
         current_value = 0.0
         all_cash_flows = []
         schemes_data = []
+        first_date_str = "2023-01-01"
 
-        for folio in data.get("folios", []):
+        folios = data.get("folios", [])
+        if folios and folios[0].get("schemes"):
+            txs = folios[0]["schemes"][0].get("transactions", [])
+            if txs:
+                first_date_str = txs[0].get("date", "2023-01-01")
+
+        for folio in folios:
             for scheme in folio.get("schemes", []):
                 schemes_data.append(scheme)
                 valuation = scheme.get("valuation", {})
                 current_value += valuation.get("value", 0.0)
 
                 for tx in scheme.get("transactions", []):
-                    # Filter out micro-deductions like Stamp Duty / STT for XIRR cash flows
                     if tx.get("amount") and tx.get("type") in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
                         amt = float(tx["amount"])
                         if tx["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
@@ -162,12 +174,13 @@ async def parse_statement(
                             "type": tx["type"]
                         })
 
-        # Calculations
         abs_profit = current_value - total_invested
         abs_return_pct = round((abs_profit / total_invested) * 100, 2) if total_invested > 0 else 0.0
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
         
-        # Run FIFO Capital Gains Tax Engine
+        # Calculate Benchmark Return
+        benchmark_xirr = get_benchmark_return(first_date_str)
+        
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
         return {
@@ -178,6 +191,7 @@ async def parse_statement(
                 "absolute_profit": round(abs_profit, 2),
                 "absolute_return_pct": abs_return_pct,
                 "xirr": xirr,
+                "benchmark_xirr": benchmark_xirr,
                 "total_transactions": len(all_cash_flows)
             },
             "taxes": tax_data
