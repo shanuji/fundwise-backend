@@ -217,7 +217,6 @@ def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
     if cache_key in BENCHMARK_PRICE_CACHE:
         return BENCHMARK_PRICE_CACHE[cache_key]
 
-    # Reverted to ^NSEI (Nifty 50 Price Return Index) for mathematical precision
     ticker = yf.Ticker("^NSEI")
     df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
     
@@ -438,8 +437,8 @@ async def parse_statement(
                     holding_days = max(0, (statement_end_dt - cf_date).days)
                     cf_data.append({"amount": cf["amount"], "days": holding_days})
                 
-                # BUGFIX: Prevent solver crash on inactive funds
-                if not cf_data:
+                # BUGFIX: Prevent solver crash on zero/negative closing value or inactive funds
+                if not cf_data or closing_value <= 0:
                     statement_annualized_return = None
                 else:
                     statement_annualized_return = solve_annualized_rate(cf_data, closing_value, context=f"Fund: {scheme_name}")
@@ -471,8 +470,8 @@ async def parse_statement(
             holding_days = max(0, (statement_end_dt - cf_date).days)
             port_cf_data.append({"amount": cf["amount"], "days": holding_days})
             
-        # BUGFIX: Safeguard portfolio solver
-        if not port_cf_data:
+        # BUGFIX: Safeguard portfolio solver on zero/negative closing value
+        if not port_cf_data or portfolio_current_value <= 0:
             portfolio_annualized_return = None
         else:
             portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
@@ -513,16 +512,17 @@ async def parse_statement(
             print(f"[Benchmark] Date: {cf_date} | {direction} | Nifty50 NAV: {nav} | Units: {units_transacted} | Balance: {benchmark_units}")
                 
         final_benchmark_nav = get_closest_benchmark_price(statement_end_str, benchmark_prices)
-        benchmark_simulated_closing_value = max(0.001, benchmark_units * final_benchmark_nav)
+        benchmark_simulated_closing_value = benchmark_units * final_benchmark_nav
         
         print(f"=== SIMULATION COMPLETE ===")
         print(f"Final Benchmark Units: {benchmark_units}")
         print(f"Final Benchmark NAV: {final_benchmark_nav}")
         print(f"Benchmark Simulated Closing Value: {benchmark_simulated_closing_value}")
 
-        # BUGFIX: Safeguard benchmark solver
-        if not benchmark_cf_data:
+        # BUGFIX: Safeguard benchmark solver on zero/negative closing value
+        if not benchmark_cf_data or benchmark_simulated_closing_value <= 0:
             benchmark_annualized = None
+            print("Benchmark Annualized Return: None (Zero/Negative Closing Value or No CFs)\n")
         else:
             benchmark_annualized = solve_annualized_rate(benchmark_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
             print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
