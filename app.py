@@ -42,11 +42,14 @@ def calculate_statement_annualized_return(cash_flows: list[dict], closing_market
     cf_data = []
     for cf in cash_flows:
         cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
+        # Exact holding days from transaction date to statement end date
         holding_days = max(0, (end_date - cf_date).days)
         cf_data.append({"amount": cf["amount"], "days": holding_days})
 
     def return_func(r):
-        return sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data) - closing_market_value
+        # mathematically solve: Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
+        compounded_sum = sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data)
+        return compounded_sum - closing_market_value
 
     def return_derivative(r):
         return sum(item["amount"] * (item["days"] / 365.0) * ((1.0 + r) ** ((item["days"] / 365.0) - 1.0)) for item in cf_data)
@@ -125,33 +128,43 @@ async def parse_statement(
                 valuation = scheme.get("valuation") or {}
                 
                 closing_value = float(valuation.get("value", 0.0) or 0.0)
-                opening_value = float(valuation.get("opening", 0.0) or valuation.get("cost", 0.0) or 0.0)
+                # The 'cost' field is the cumulative historical cost AT THE END of the statement
+                closing_total_cost = float(valuation.get("cost", 0.0) or 0.0) 
                 
                 fund_investments = 0.0
                 fund_redemptions = 0.0
-                fund_cash_flows = []
+                tx_list = []
                 
+                for tx in scheme.get("transactions", []):
+                    tx_date_str = parse_flexible_date(str(tx.get("date", "")))
+                    
+                    if statement_start_str <= tx_date_str:
+                        amt = float(tx.get("amount", 0.0))
+                        tx_type = str(tx.get("type", "")).split('.')[-1].upper()
+                        
+                        # Strict categorization based on pure inflow/outflow logic
+                        if tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "STP_IN"]:
+                            amt = abs(amt)
+                            fund_investments += amt
+                            tx_list.append({"date": tx_date_str, "amount": amt})
+                        elif tx_type in ["REDEMPTION", "SWITCH_OUT", "STP_OUT"]:
+                            amt = abs(amt)
+                            fund_redemptions += amt
+                            tx_list.append({"date": tx_date_str, "amount": -amt}) # Negative CF
+
+                # Reverse engineer the true Opening Value strictly for the statement period
+                opening_value = closing_total_cost - (fund_investments - fund_redemptions)
+                opening_value = max(0.0, opening_value) # Safety bound
+                
+                fund_cash_flows = []
                 if opening_value > 0:
                     fund_cash_flows.append({
                         "date": statement_start_str,
                         "amount": opening_value
                     })
+                fund_cash_flows.extend(tx_list)
 
-                # Pure numerical cash flow tracing
-                for tx in scheme.get("transactions", []):
-                    tx_date_str = parse_flexible_date(str(tx.get("date", "")))
-                    
-                    if statement_start_str <= tx_date_str:
-                        amt = tx.get("amount")
-                        if amt is not None:
-                            amt = float(amt)
-                            if amt > 0:
-                                fund_investments += amt
-                                fund_cash_flows.append({"date": tx_date_str, "amount": amt})
-                            elif amt < 0:
-                                fund_redemptions += abs(amt)
-                                fund_cash_flows.append({"date": tx_date_str, "amount": amt}) # amt is inherently negative
-
+                # Capital Deployed explicitly derived from user's rule
                 capital_deployed = opening_value + fund_investments - fund_redemptions
                 absolute_profit = closing_value - capital_deployed
                 absolute_return_pct = round((absolute_profit / capital_deployed) * 100, 2) if capital_deployed > 0 else 0.0
@@ -173,6 +186,7 @@ async def parse_statement(
                 portfolio_current_value += closing_value
                 portfolio_cash_flows.extend(fund_cash_flows)
 
+        # Final Portfolio Summary calculations 
         total_capital_deployed = portfolio_opening_value + portfolio_total_investments - portfolio_total_redemptions
         total_profit = portfolio_current_value - total_capital_deployed
         portfolio_abs_return_pct = round((total_profit / total_capital_deployed) * 100, 2) if total_capital_deployed > 0 else 0.0
