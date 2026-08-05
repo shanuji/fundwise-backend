@@ -7,8 +7,9 @@ import tempfile
 import os
 import yfinance as yf
 import json
+import requests
 
-app = FastAPI(title="FundWise Precision Statement Engine")
+app = FastAPI(title="FundWise Custom Statement Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,6 +17,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Global Cache for Historical NAV lookups
+NAV_CACHE = {}
+
+# Strict Transaction Categorization Mapping
+TXN_MAP = {
+    "PURCHASE": 1,
+    "ADDITIONAL PURCHASE": 1,
+    "FRESH PURCHASE": 1,
+    "SIP": 1,
+    "LUMPSUM": 1,
+    "SWITCH IN": 1,
+    "STP IN": 1,
+    "DIVIDEND REINVESTMENT": 1,
+    "DIVIDEND REINVEST": 1,
+    
+    "REDEMPTION": -1,
+    "SWITCH OUT": -1,
+    "STP OUT": -1,
+    "SWP": -1,
+    "DIVIDEND PAYOUT": -1,
+    
+    "SEGREGATION": 0,
+    "MERGER": 0,
+    "REVERSE MERGER": 0,
+    "BONUS": 0,
+    "BONUS UNITS": 0,
+    "CORPORATE ACTION": 0,
+    "REVERSAL": 0,
+    "STAMP DUTY": 0,
+    "TDS": 0,
+    "TAX": 0
+}
+
+def normalize_txn_type(txn_type: str) -> int:
+    """Normalizes the transaction string and returns 1 (Inflow), -1 (Outflow), or 0 (Neutral)."""
+    clean_type = str(txn_type).replace("_", " ").replace("-", " ").strip().upper()
+    for key, val in TXN_MAP.items():
+        if key in clean_type:
+            return val
+    return 0
 
 def parse_flexible_date(date_str: str) -> str:
     if not date_str:
@@ -35,10 +77,40 @@ def parse_flexible_date(date_str: str) -> str:
             continue
     return "2025-04-01"
 
+def fetch_historical_nav(isin: str, scheme_name: str, date_str: str) -> float:
+    """Fetches historical NAV from mfapi.in using ISIN or Scheme Name, with local caching."""
+    if not isin and not scheme_name:
+        return None
+        
+    cache_key = f"{isin}_{date_str}"
+    if cache_key in NAV_CACHE:
+        return NAV_CACHE[cache_key]
+
+    try:
+        search_query = isin if isin else scheme_name
+        search_resp = requests.get(f"https://api.mfapi.in/mf/search?q={search_query}", timeout=5)
+        if search_resp.status_code == 200:
+            data = search_resp.json()
+            if data and len(data) > 0:
+                scheme_code = data[0]['schemeCode']
+                nav_resp = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=5)
+                if nav_resp.status_code == 200:
+                    nav_data = nav_resp.json().get('data', [])
+                    target_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%m-%Y")
+                    for entry in nav_data:
+                        if entry['date'] == target_date:
+                            nav_val = float(entry['nav'])
+                            NAV_CACHE[cache_key] = nav_val
+                            return nav_val
+    except Exception:
+        pass
+    return None
+
 def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> float:
     """
-    Solves for 'r' where: Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
-    Using Newton-Raphson -> Brentq -> Binary Search fallbacks.
+    Mathematically solves for the annualized rate 'r' such that:
+    Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
+    Bounded between -99% and +200%.
     """
     if not cf_data or closing_market_value <= 0:
         return 0.0
@@ -54,43 +126,35 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> f
                 deriv += item["amount"] * t * ((1.0 + r) ** (t - 1.0))
         return deriv
 
-    # 1. Newton-Raphson
+    # 1. Newton-Raphson Optimization
     try:
-        rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=1000)
-        if not isinstance(rate, complex) and rate > -1.0:
+        rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=500)
+        if not isinstance(rate, complex) and -0.99 <= rate <= 2.0:
             return round(float(rate) * 100, 2)
     except Exception:
         pass
 
-    # 2. Brent's Method
+    # 2. Brent's Method Fallback (-99% to 200%)
     try:
-        rate = brentq(return_func, -0.9999, 100.0, maxiter=1000)
+        rate = brentq(return_func, -0.99, 2.0, maxiter=500)
         return round(float(rate) * 100, 2)
     except Exception:
         pass
 
-    # 3. Binary Search (Bisection Fallback)
-    low, high = -0.9999, 100.0
+    # 3. Binary Search Fallback (-99% to 200%)
+    low, high = -0.99, 2.0
+    mid = 0.0
     for _ in range(100):
         mid = (low + high) / 2.0
         val = return_func(mid)
         if abs(val) < 1e-5:
             return round(mid * 100, 2)
         if val > 0:
-            high = mid  # Future value is too high, lower the rate
+            high = mid
         else:
-            low = mid   # Future value is too low, raise the rate
+            low = mid
             
     return round(mid * 100, 2)
-
-def calculate_statement_annualized_return(cash_flows: list[dict], closing_market_value: float, end_date: datetime) -> float:
-    cf_data = []
-    for cf in cash_flows:
-        cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
-        holding_days = max(0, (end_date - cf_date).days)
-        cf_data.append({"amount": cf["amount"], "days": holding_days})
-        
-    return solve_annualized_rate(cf_data, closing_market_value)
 
 def get_benchmark_return(start_date_str: str, end_date_str: str) -> float:
     try:
@@ -158,29 +222,37 @@ async def parse_statement(
         funds_breakdown = []
         folios = data.get("folios", [])
         
-        inflow_keywords = ["PURCHASE", "SIP", "LUMPSUM", "SWITCH IN", "STP IN", "DIVIDEND REINVEST"]
-        outflow_keywords = ["REDEMPTION", "SWITCH OUT", "STP OUT", "SWP", "DIVIDEND PAYOUT"]
-        neutral_keywords = ["SEGREGATION", "MERGER", "REVERSE MERGER", "BONUS", "STAMP"]
-        
         for folio in folios:
             for scheme in folio.get("schemes", []):
                 scheme_name = scheme.get("scheme", "Unknown Fund")
                 valuation = scheme.get("valuation") or {}
-                
                 closing_value = float(valuation.get("value", 0.0) or 0.0)
                 
-                # Accurately isolate starting market value
-                opening_value = float(valuation.get("opening", valuation.get("opening_value", 0.0)))
-                if opening_value <= 0.0:
-                    opening_units = float(scheme.get("open", 0.0))
-                    if opening_units > 0:
-                        first_nav = None
-                        for tx in scheme.get("transactions", []):
-                            if tx.get("nav") is not None:
-                                first_nav = float(tx["nav"])
-                                break
-                        if first_nav:
-                            opening_value = opening_units * first_nav
+                # Rule 1: Accurately Determine True Opening Market Value
+                opening_value = None
+                open_units = float(scheme.get("open", 0.0))
+                
+                # Priority A: casparser explicit opening_value
+                if "opening_value" in scheme and scheme["opening_value"] is not None:
+                    opening_value = float(scheme["opening_value"])
+                
+                # Priority B: Calculate from internal open_nav
+                if opening_value is None and open_units > 0:
+                    if "open_nav" in scheme and scheme["open_nav"]:
+                        opening_value = open_units * float(scheme["open_nav"])
+                        
+                # Priority C: Fetch Historical NAV via API
+                if opening_value is None and open_units > 0:
+                    fetched_nav = fetch_historical_nav(scheme.get("isin", ""), scheme_name, statement_start_str)
+                    if fetched_nav:
+                        opening_value = open_units * fetched_nav
+                        
+                # Hard Error if Opening Market Value cannot be determined
+                if opening_value is None and open_units > 0:
+                    raise ValueError(f"Opening Market Value could not be determined accurately for {scheme_name}. NAV on {statement_start_str} is required.")
+                
+                if opening_value is None:
+                    opening_value = 0.0
                 
                 fund_investments = 0.0
                 fund_redemptions = 0.0
@@ -189,36 +261,23 @@ async def parse_statement(
                 for tx in scheme.get("transactions", []):
                     tx_date_str = parse_flexible_date(str(tx.get("date", "")))
                     
+                    # Process strictly within statement period
                     if statement_start_str <= tx_date_str <= statement_end_str:
                         amt_val = tx.get("amount")
                         if amt_val is not None:
-                            amt = float(amt_val)
-                            tx_type_upper = str(tx.get("type", "")).replace("_", " ").upper()
+                            amt_abs = abs(float(amt_val))
+                            tx_dir = normalize_txn_type(tx.get("type", ""))
                             
-                            is_inflow = any(kw in tx_type_upper for kw in inflow_keywords)
-                            is_outflow = any(kw in tx_type_upper for kw in outflow_keywords)
-                            is_neutral = any(kw in tx_type_upper for kw in neutral_keywords)
-                            
-                            if is_neutral or amt == 0:
-                                continue
-                                
-                            if is_inflow:
-                                amt_abs = abs(amt)
+                            # Rule 5 & 6: Explicit signed cash flows based on mapping
+                            if tx_dir == 1:
                                 fund_investments += amt_abs
-                                tx_list.append({"date": tx_date_str, "amount": amt_abs})
-                            elif is_outflow:
-                                amt_abs = abs(amt)
+                                tx_list.append({"date": tx_date_str, "amount": amt_abs}) # Positive
+                            elif tx_dir == -1:
                                 fund_redemptions += amt_abs
-                                tx_list.append({"date": tx_date_str, "amount": -amt_abs})
-                            else:
-                                if amt > 0:
-                                    fund_investments += amt
-                                    tx_list.append({"date": tx_date_str, "amount": amt})
-                                elif amt < 0:
-                                    fund_redemptions += abs(amt)
-                                    tx_list.append({"date": tx_date_str, "amount": amt})
-
+                                tx_list.append({"date": tx_date_str, "amount": -amt_abs}) # Negative
+                            
                 fund_cash_flows = []
+                # Rule 4: Opening value treated as investment on statement start date
                 if opening_value > 0:
                     fund_cash_flows.append({
                         "date": statement_start_str,
@@ -226,10 +285,18 @@ async def parse_statement(
                     })
                 fund_cash_flows.extend(tx_list)
 
+                # Rule 11: Standardized Capital Deployed and Profit math
                 capital_deployed = opening_value + fund_investments - fund_redemptions
                 absolute_profit = closing_value - capital_deployed
                 absolute_return_pct = round((absolute_profit / capital_deployed) * 100, 2) if capital_deployed > 0 else 0.0
-                statement_annualized_return = calculate_statement_annualized_return(fund_cash_flows, closing_value, statement_end_dt)
+                
+                # Rule 3: Solve statement annualized return
+                cf_data = []
+                for cf in fund_cash_flows:
+                    cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
+                    holding_days = max(0, (statement_end_dt - cf_date).days)
+                    cf_data.append({"amount": cf["amount"], "days": holding_days})
+                statement_annualized_return = solve_annualized_rate(cf_data, closing_value)
 
                 funds_breakdown.append({
                     "scheme_name": scheme_name,
@@ -241,17 +308,26 @@ async def parse_statement(
                     "statement_annualized_return": statement_annualized_return
                 })
 
+                # Rule 6: Aggregate every cash flow to portfolio list without altering signs
                 portfolio_opening_value += opening_value
                 portfolio_total_investments += fund_investments
                 portfolio_total_redemptions += fund_redemptions
                 portfolio_current_value += closing_value
                 portfolio_cash_flows.extend(fund_cash_flows)
 
+        # Portfolio Aggregation Math
         total_capital_deployed = portfolio_opening_value + portfolio_total_investments - portfolio_total_redemptions
         total_profit = portfolio_current_value - total_capital_deployed
         portfolio_abs_return_pct = round((total_profit / total_capital_deployed) * 100, 2) if total_capital_deployed > 0 else 0.0
         
-        portfolio_annualized_return = calculate_statement_annualized_return(portfolio_cash_flows, portfolio_current_value, statement_end_dt)
+        # Rule 6: Solve single rate for total aggregated portfolio
+        port_cf_data = []
+        for cf in portfolio_cash_flows:
+            cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
+            holding_days = max(0, (statement_end_dt - cf_date).days)
+            port_cf_data.append({"amount": cf["amount"], "days": holding_days})
+            
+        portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value)
         benchmark_annualized = get_benchmark_return(statement_start_str, statement_end_str)
 
         return {
@@ -272,6 +348,8 @@ async def parse_statement(
             "funds_breakdown": funds_breakdown
         }
 
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"CAS Parse Failed: {str(e)}")
 
