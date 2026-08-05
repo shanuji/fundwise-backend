@@ -7,7 +7,7 @@ from datetime import datetime
 import tempfile
 import os
 import yfinance as yf
-import json  # ADDED: Crucial for foolproof extraction
+import json
 
 app = FastAPI(title="FundWise Precision Engine")
 
@@ -144,8 +144,6 @@ async def parse_statement(
         tmp_path = tmp.name
 
     try:
-        # THE FIX: Export straight to a JSON string, then load back to a pure dictionary. 
-        # This completely destroys the 'CASData' object conflict.
         raw_json_str = casparser.read_cas_pdf(tmp_path, password=password, output="json")
         data = json.loads(raw_json_str)
         
@@ -164,8 +162,12 @@ async def parse_statement(
         for folio in folios:
             for scheme in folio.get("schemes", []):
                 schemes_data.append(scheme)
-                valuation = scheme.get("valuation", {})
-                current_value += valuation.get("value", 0.0)
+                valuation = scheme.get("valuation") or {}
+                
+                # THE FIX: Safely convert the JSON string value into a pure float
+                raw_val = valuation.get("value", 0.0)
+                if raw_val is not None and str(raw_val).strip() != "":
+                    current_value += float(raw_val)
 
                 for tx in scheme.get("transactions", []):
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
