@@ -21,7 +21,8 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
     if not cash_flows:
         return 0.0
 
-    dates = [datetime.strptime(cf["date"], "%Y-%m-%d") for cf in cash_flows]
+    # Safely convert incoming dates (whether they are strings or date objects) to strings for parsing
+    dates = [datetime.strptime(str(cf["date"])[:10], "%Y-%m-%d") for cf in cash_flows]
     amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"] else abs(cf["amount"]) for cf in cash_flows]
 
     dates.append(end_date)
@@ -44,9 +45,10 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
 
 def get_benchmark_return(start_date_str: str) -> float:
     try:
-        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        clean_date = str(start_date_str)[:10]
+        start_date = datetime.strptime(clean_date, "%Y-%m-%d")
         ticker = yf.Ticker("^NSEI")
-        df = ticker.history(start=start_date_str)
+        df = ticker.history(start=clean_date)
         
         if df.empty:
             return 14.0 
@@ -69,17 +71,22 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
     
     for scheme in schemes_data:
         buy_queue = [] 
-        transactions = sorted(scheme.get("transactions", []), key=lambda x: datetime.strptime(x["date"], "%Y-%m-%d"))
+        # Safely sort transactions by extracting the first 10 characters of the date string
+        transactions = sorted(
+            scheme.get("transactions", []), 
+            key=lambda x: datetime.strptime(str(x["date"])[:10], "%Y-%m-%d")
+        )
         
         for tx in transactions:
-            t_type = tx.get("type")
+            # Force the enum/type to be a clean string
+            t_type = str(tx.get("type", "")).split('.')[-1].upper()
             units = tx.get("units")
             nav = tx.get("nav")
             
             if units is None or nav is None:
                 continue
                 
-            date_obj = datetime.strptime(tx["date"], "%Y-%m-%d")
+            date_obj = datetime.strptime(str(tx["date"])[:10], "%Y-%m-%d")
                 
             if t_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
                 buy_queue.append({'date': date_obj, 'units': float(units), 'nav': float(nav)})
@@ -124,7 +131,7 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
 @app.post("/api/v1/parse-cas")
 async def parse_statement(
     file: UploadFile = File(...),
-    password: str = Form(""), # Defaults to empty string if left blank
+    password: str = Form(""),
     ltcg_rate: float = Form(12.5),
     stcg_rate: float = Form(20.0),
     exemption_limit: float = Form(125000.0),
@@ -139,8 +146,16 @@ async def parse_statement(
         tmp_path = tmp.name
 
     try:
-        # The engine applies the password. If it is "", it reads it as unprotected.
-        data = casparser.read_cas_pdf(tmp_path, password=password, output="dict")
+        # 1. Parse the PDF using casparser
+        raw_data = casparser.read_cas_pdf(tmp_path, password=password)
+        
+        # 2. Safely convert the custom CASData object into a standard Python dictionary
+        if hasattr(raw_data, "model_dump"):
+            data = raw_data.model_dump()
+        elif hasattr(raw_data, "dict"):
+            data = raw_data.dict()
+        else:
+            data = vars(raw_data)
         
         total_invested = 0.0
         current_value = 0.0
@@ -152,7 +167,7 @@ async def parse_statement(
         if folios and folios[0].get("schemes"):
             txs = folios[0]["schemes"][0].get("transactions", [])
             if txs:
-                first_date_str = txs[0].get("date", "2023-01-01")
+                first_date_str = str(txs[0].get("date", "2023-01-01"))[:10]
 
         for folio in folios:
             for scheme in folio.get("schemes", []):
@@ -161,19 +176,23 @@ async def parse_statement(
                 current_value += valuation.get("value", 0.0)
 
                 for tx in scheme.get("transactions", []):
-                    if tx.get("amount") and tx.get("type") in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
+                    tx_type = str(tx.get("type", "")).split('.')[-1].upper()
+                    
+                    if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
                         amt = float(tx["amount"])
-                        if tx["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
+                        
+                        if tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
                             total_invested += amt
                             
                         all_cash_flows.append({
-                            "date": tx["date"],
+                            "date": str(tx["date"])[:10],
                             "amount": amt,
-                            "type": tx["type"]
+                            "type": tx_type
                         })
 
         abs_profit = current_value - total_invested
         abs_return_pct = round((abs_profit / total_invested) * 100, 2) if total_invested > 0 else 0.0
+        
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
         benchmark_xirr = get_benchmark_return(first_date_str)
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
@@ -193,7 +212,6 @@ async def parse_statement(
         }
 
     except Exception as e:
-        # This will securely pass a clear message if the wrong password is provided
         raise HTTPException(status_code=422, detail=f"CAS Parse Failed: {str(e)}")
 
     finally:
