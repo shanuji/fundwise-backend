@@ -149,6 +149,7 @@ async def parse_statement(
         
         total_invested = 0.0
         current_value = 0.0
+        opening_cost_total = 0.0
         all_cash_flows = []
         schemes_data = []
         first_date_str = "2023-01-01"
@@ -164,23 +165,24 @@ async def parse_statement(
                 schemes_data.append(scheme)
                 valuation = scheme.get("valuation") or {}
                 
-                # Extract Current Value
                 raw_val = valuation.get("value", 0.0)
                 if raw_val is not None and str(raw_val).strip() != "":
                     current_value += float(raw_val)
 
-                # THE FIX: Extract the official Cost Value directly from the CAS
                 raw_cost = valuation.get("cost", 0.0)
                 if raw_cost is not None and str(raw_cost).strip() != "":
                     total_invested += float(raw_cost)
+
+                # Extract scheme-level opening cost if available
+                opening_val = valuation.get("opening", 0.0)
+                if opening_val is not None and str(opening_val).strip() != "":
+                    opening_cost_total += float(opening_val)
 
                 for tx in scheme.get("transactions", []):
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
                     if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
                         amt = float(tx["amount"])
-                        
-                        # Note: We no longer manually add 'amt' to total_invested here
                             
                         all_cash_flows.append({
                             "date": str(tx["date"])[:10],
@@ -200,6 +202,7 @@ async def parse_statement(
             "summary": {
                 "capital_invested": round(total_invested, 2),
                 "current_value": round(current_value, 2),
+                "opening_balance": round(opening_cost_total, 2), # Added Opening Balance
                 "absolute_profit": round(abs_profit, 2),
                 "absolute_return_pct": abs_return_pct,
                 "xirr": xirr,
