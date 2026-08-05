@@ -1,7 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import casparser
-import numpy_financial as npf
 from scipy.optimize import newton
 from datetime import datetime
 import tempfile
@@ -9,7 +8,7 @@ import os
 import yfinance as yf
 import json
 
-app = FastAPI(title="FundWise Precision Engine")
+app = FastAPI(title="FundWise Custom Period Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,30 +35,45 @@ def parse_flexible_date(date_str: str) -> str:
             continue
     return "2025-04-01"
 
-def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date: datetime) -> float:
+def calculate_statement_annualized_return(cash_flows: list[dict], closing_market_value: float, end_date: datetime) -> float:
+    """
+    Solves mathematically for the annualized rate 'r' such that:
+    Closing Value = sum(CF * (1 + r)^(HoldingDays / 365))
+    Where HoldingDays = Number of days from the cash flow date until the statement end date.
+    """
     if not cash_flows:
         return 0.0
 
-    dates = [datetime.strptime(parse_flexible_date(cf["date"]), "%Y-%m-%d") for cf in cash_flows]
-    amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "DIVIDEND_REINVEST", "OPENING_VALUATION"] else abs(cf["amount"]) for cf in cash_flows]
+    end_dt = end_date
+    cf_data = []
+    
+    for cf in cash_flows:
+        cf_date = datetime.strptime(parse_flexible_date(cf["date"]), "%Y-%m-%d")
+        holding_days = (end_dt - cf_date).days
+        if holding_days < 0:
+            holding_days = 0
+            
+        # Opening value & investments are positive cash flows compounding towards closing value
+        # Redemptions/switch-outs are negative cash flows reducing the base
+        amount = abs(cf["amount"]) if cf["type"] in ["OPENING_VALUE", "INVESTMENT", "SIP", "PURCHASE", "SWITCH_IN", "DIVIDEND_REINVEST"] else -abs(cf["amount"])
+        cf_data.append({"amount": amount, "days": holding_days})
 
-    dates.append(end_date)
-    amounts.append(current_market_value)
+    def return_func(r):
+        # We want: Closing Value - sum(CF * (1 + r)^(days/365)) = 0
+        compounded_sum = sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data)
+        return compounded_sum - closing_market_value
 
-    start_date = dates[0]
-    days = [(d - start_date).days for d in dates]
-
-    def xirr_func(r):
-        return sum(a / ((1 + r) ** (day / 365.0)) for a, day in zip(amounts, days))
-
-    def xirr_derivative(r):
-        return sum(-a * (day / 365.0) / ((1 + r) ** ((day / 365.0) + 1)) for a, day in zip(amounts, days))
+    def return_derivative(r):
+        # Derivative with respect to r
+        return sum(item["amount"] * (item["days"] / 365.0) * ((1.0 + r) ** ((item["days"] / 365.0) - 1.0)) for item in cf_data)
 
     try:
-        rate = newton(xirr_func, 0.10, fprime=xirr_derivative, maxiter=100)
-        return round(rate * 100, 2)
+        # Newton-Raphson optimization starting at 10% (0.10)
+        rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=100)
+        return round(float(rate) * 100, 2)
     except Exception:
-        return round(npf.irr(amounts) * 100, 2)
+        # Fallback approximation if convergence fails
+        return 0.0
 
 def get_benchmark_return(start_date_str: str) -> float:
     try:
@@ -83,67 +97,6 @@ def get_benchmark_return(start_date_str: str) -> float:
     except Exception:
         return 14.2
 
-def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
-    total_stcg = 0.0
-    total_ltcg = 0.0
-    
-    for scheme in schemes_data:
-        buy_queue = [] 
-        transactions = sorted(
-            scheme.get("transactions", []), 
-            key=lambda x: datetime.strptime(parse_flexible_date(x["date"]), "%Y-%m-%d")
-        )
-        
-        for tx in transactions:
-            t_type = str(tx.get("type", "")).split('.')[-1].upper()
-            units = tx.get("units")
-            nav = tx.get("nav")
-            
-            if units is None or nav is None:
-                continue
-                
-            date_obj = datetime.strptime(parse_flexible_date(tx["date"]), "%Y-%m-%d")
-                
-            if t_type in ["PURCHASE", "SIP", "DIVIDEND_REINVEST"]:
-                buy_queue.append({'date': date_obj, 'units': float(units), 'nav': float(nav)})
-            
-            elif t_type in ["REDEMPTION", "SWITCH_OUT"]:
-                sell_units = abs(float(units))
-                sell_nav = float(nav)
-                
-                while sell_units > 0.0001 and buy_queue:
-                    oldest_buy = buy_queue[0]
-                    buy_date = oldest_buy['date']
-                    buy_nav = oldest_buy['nav']
-                    available_units = oldest_buy['units']
-                    
-                    units_to_sell = min(sell_units, available_units)
-                    days_held = (date_obj - buy_date).days
-                    gain = (sell_nav - buy_nav) * units_to_sell
-                    
-                    if days_held > 365:
-                        total_ltcg += gain
-                    else:
-                        total_stcg += gain
-                        
-                    sell_units -= units_to_sell
-                    buy_queue[0]['units'] -= units_to_sell
-                    
-                    if buy_queue[0]['units'] <= 0.0001:
-                        buy_queue.pop(0)
-
-    taxable_ltcg = max(0, total_ltcg - exemption_limit)
-    ltcg_tax = taxable_ltcg * (ltcg_rate / 100.0)
-    stcg_tax = max(0, total_stcg) * (stcg_rate / 100.0)
-    total_tax = max(0, ltcg_tax) + max(0, stcg_tax)
-    
-    return {
-        "realized_stcg": round(total_stcg, 2),
-        "realized_ltcg": round(total_ltcg, 2),
-        "taxable_ltcg": round(taxable_ltcg, 2),
-        "estimated_tax_liability": round(total_tax, 2)
-    }
-
 @app.post("/api/v1/parse-cas")
 async def parse_statement(
     file: UploadFile = File(...),
@@ -165,36 +118,43 @@ async def parse_statement(
         raw_json_str = casparser.read_cas_pdf(tmp_path, password=password, output="json")
         data = json.loads(raw_json_str)
         
-        current_value = 0.0
-        opening_cost_total = 0.0
-        period_inflows = 0.0
-        period_outflows = 0.0
-        all_cash_flows = []
-        fresh_cash_flows = []
-        schemes_data = []
-        
         statement_start_date = "2025-04-01"
+        statement_end_date = datetime.now()
+        
         period_info = data.get("statement_period")
-        if isinstance(period_info, dict) and period_info.get("from"):
-            statement_start_date = parse_flexible_date(period_info.get("from"))
+        if isinstance(period_info, dict):
+            if period_info.get("from"):
+                statement_start_date = parse_flexible_date(period_info.get("from"))
+            if period_info.get("to"):
+                statement_end_date = datetime.strptime(parse_flexible_date(period_info.get("to")), "%Y-%m-%d")
 
+        portfolio_opening_value = 0.0
+        portfolio_total_investments = 0.0
+        portfolio_total_redemptions = 0.0
+        portfolio_current_value = 0.0
+        portfolio_cash_flows = []
+        
+        funds_breakdown = []
         folios = data.get("folios", [])
+        
         for folio in folios:
             for scheme in folio.get("schemes", []):
-                schemes_data.append(scheme)
+                scheme_name = scheme.get("scheme", "Unknown Fund")
                 valuation = scheme.get("valuation") or {}
                 
-                val_amount = float(valuation.get("value", 0.0) or 0.0)
-                opening_cost = float(valuation.get("opening", 0.0) or valuation.get("cost", 0.0) or 0.0)
+                closing_value = float(valuation.get("value", 0.0) or 0.0)
+                opening_value = float(valuation.get("opening", 0.0) or valuation.get("cost", 0.0) or 0.0)
                 
-                current_value += val_amount
-                opening_cost_total += opening_cost
-
-                if opening_cost > 0:
-                    all_cash_flows.append({
+                fund_investments = 0.0
+                fund_redemptions = 0.0
+                fund_cash_flows = []
+                
+                # Rule 1: Opening market value treated as investment made on statement start date
+                if opening_value > 0:
+                    fund_cash_flows.append({
                         "date": statement_start_date,
-                        "amount": opening_cost,
-                        "type": "OPENING_VALUATION"
+                        "amount": opening_value,
+                        "type": "OPENING_VALUE"
                     })
 
                 for tx in scheme.get("transactions", []):
@@ -202,43 +162,65 @@ async def parse_statement(
                     tx_date = parse_flexible_date(tx_date_raw)
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
-                    if tx_date >= statement_start_date:
-                        # Exclude internal switch-ins from external new capital deployed
-                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "DIVIDEND_REINVEST"]:
+                    if statement_start_date <= tx_date:
+                        if tx.get("amount"):
                             amt = float(tx["amount"])
-                            period_inflows += amt
-                            all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
-                            fresh_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
-                        elif tx.get("amount") and tx_type in ["REDEMPTION", "SWITCH_OUT"]:
-                            amt = float(tx["amount"])
-                            period_outflows += abs(amt)
-                            all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
+                            # Rule 2: Investments during statement period
+                            if tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
+                                fund_investments += amt
+                                fund_cash_flows.append({"date": tx_date, "amount": amt, "type": "INVESTMENT"})
+                            # Rule 3: Redemptions or Switch-Outs treated as negative cash flows
+                            elif tx_type in ["REDEMPTION", "SWITCH_OUT"]:
+                                amt_abs = abs(amt)
+                                fund_redemptions += amt_abs
+                                fund_cash_flows.append({"date": tx_date, "amount": amt_abs, "type": "REDEMPTION"})
 
-        total_period_corpus = opening_cost_total + period_inflows
-        absolute_profit = current_value - (total_period_corpus - period_outflows)
-        absolute_return_pct = round((absolute_profit / total_period_corpus) * 100, 2) if total_period_corpus > 0 else 0.0
-        
-        xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
-        fresh_xirr = calculate_xirr(fresh_cash_flows, period_inflows + (absolute_profit if period_inflows > 0 else 0), datetime.now()) if fresh_cash_flows else 0.0
-        
+                # Fund-wise Calculations
+                capital_deployed = opening_value + fund_investments - fund_redemptions
+                absolute_profit = closing_value - capital_deployed
+                absolute_return_pct = round((absolute_profit / capital_deployed) * 100, 2) if capital_deployed > 0 else 0.0
+                statement_annualized_return = calculate_statement_annualized_return(fund_cash_flows, closing_value, statement_end_date)
+
+                funds_breakdown.append({
+                    "scheme_name": scheme_name,
+                    "opening_value": round(opening_value, 2),
+                    "capital_deployed": round(capital_deployed, 2),
+                    "current_value": round(closing_value, 2),
+                    "absolute_profit": round(absolute_profit, 2),
+                    "absolute_return_pct": absolute_return_pct,
+                    "statement_annualized_return": statement_annualized_return
+                })
+
+                # Aggregate Portfolio-wise totals
+                portfolio_opening_value += opening_value
+                portfolio_total_investments += fund_investments
+                portfolio_total_redemptions += fund_redemptions
+                portfolio_current_value += closing_value
+                portfolio_cash_flows.extend(fund_cash_flows)
+
+        # Portfolio-wise Summary Calculations
+        total_capital_deployed = portfolio_opening_value + portfolio_total_investments - portfolio_total_redemptions
+        total_profit = portfolio_current_value - total_capital_deployed
+        portfolio_abs_return_pct = round((total_profit / total_capital_deployed) * 100, 2) if total_capital_deployed > 0 else 0.0
+        portfolio_annualized_return = calculate_statement_annualized_return(portfolio_cash_flows, portfolio_current_value, statement_end_date)
         benchmark_xirr = get_benchmark_return(statement_start_date)
-        tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
         return {
             "status": "success",
-            "summary": {
-                "capital_invested": round(period_inflows, 2),
-                "current_value": round(current_value, 2),
-                "opening_balance": round(opening_cost_total, 2),
-                "statement_start_date": statement_start_date,
-                "absolute_profit": round(absolute_profit, 2),
-                "absolute_return_pct": absolute_return_pct,
-                "xirr": xirr,
-                "fresh_xirr": fresh_xirr,
-                "benchmark_xirr": benchmark_xirr,
-                "total_transactions": len(all_cash_flows)
+            "statement_period": {
+                "from": statement_start_date,
+                "to": statement_end_date.strftime("%Y-%m-%d")
             },
-            "taxes": tax_data
+            "portfolio_summary": {
+                "opening_portfolio_value": round(portfolio_opening_value, 2),
+                "total_capital_deployed": round(total_capital_deployed, 2),
+                "current_portfolio_value": round(portfolio_current_value, 2),
+                "total_profit": round(total_profit, 2),
+                "absolute_return_pct": portfolio_abs_return_pct,
+                "statement_annualized_return": portfolio_annualized_return,
+                "benchmark_annualized_return": benchmark_xirr
+            },
+            "funds_breakdown": funds_breakdown
         }
 
     except Exception as e:
