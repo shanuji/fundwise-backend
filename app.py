@@ -23,7 +23,7 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
         return 0.0
 
     dates = [datetime.strptime(str(cf["date"])[:10], "%Y-%m-%d") for cf in cash_flows]
-    amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"] else abs(cf["amount"]) for cf in cash_flows]
+    amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "OPENING_VALUATION"] else abs(cf["amount"]) for cf in cash_flows]
 
     dates.append(end_date)
     amounts.append(current_market_value)
@@ -147,64 +147,76 @@ async def parse_statement(
         raw_json_str = casparser.read_cas_pdf(tmp_path, password=password, output="json")
         data = json.loads(raw_json_str)
         
-        total_invested = 0.0
         current_value = 0.0
+        total_cost = 0.0
         opening_cost_total = 0.0
+        opening_market_total = 0.0
         all_cash_flows = []
         schemes_data = []
-        first_date_str = "2023-01-01"
+        statement_start_date = "2025-04-01" # Default fallback matching statement period[span_2](start_span)[span_2](end_span)
 
         folios = data.get("folios", [])
-        if folios and folios[0].get("schemes"):
-            txs = folios[0]["schemes"][0].get("transactions", [])
-            if txs:
-                first_date_str = str(txs[0].get("date", "2023-01-01"))[:10]
+        
+        # Extract statement period start date dynamically if present in header
+        period_info = data.get("statement_period", {})
+        if period_info and period_info.get("from"):
+            statement_start_date = str(period_info.get("from"))[:10]
 
         for folio in folios:
             for scheme in folio.get("schemes", []):
                 schemes_data.append(scheme)
                 valuation = scheme.get("valuation") or {}
                 
-                raw_val = valuation.get("value", 0.0)
-                if raw_val is not None and str(raw_val).strip() != "":
-                    current_value += float(raw_val)
+                val_amount = float(valuation.get("value", 0.0) or 0.0)
+                cost_amount = float(valuation.get("cost", 0.0) or 0.0)
+                opening_cost = float(valuation.get("opening", 0.0) or 0.0)
+                
+                current_value += val_amount
+                total_cost += cost_amount
+                opening_cost_total += opening_cost
 
-                raw_cost = valuation.get("cost", 0.0)
-                if raw_cost is not None and str(raw_cost).strip() != "":
-                    total_invested += float(raw_cost)
-
-                # Extract scheme-level opening cost if available
-                opening_val = valuation.get("opening", 0.0)
-                if opening_val is not None and str(opening_val).strip() != "":
-                    opening_cost_total += float(opening_val)
+                # If there's an opening balance value, treat it as a portfolio injection on day 1 of the statement
+                if opening_cost > 0:
+                    opening_market_total += opening_cost # Approximation for opening valuation if market split isn't indexed
+                    all_cash_flows.append({
+                        "date": statement_start_date,
+                        "amount": opening_cost,
+                        "type": "OPENING_VALUATION"
+                    })
 
                 for tx in scheme.get("transactions", []):
+                    tx_date = str(tx.get("date", ""))[:10]
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
-                    if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
-                        amt = float(tx["amount"])
-                            
-                        all_cash_flows.append({
-                            "date": str(tx["date"])[:10],
-                            "amount": amt,
-                            "type": tx_type
-                        })
+                    # Only include transactions that occurred ON or AFTER the statement start date
+                    if tx_date >= statement_start_date:
+                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
+                            amt = float(tx["amount"])
+                            all_cash_flows.append({
+                                "date": tx_date,
+                                "amount": amt,
+                                "type": tx_type
+                            })
 
-        abs_profit = current_value - total_invested
-        abs_return_pct = round((abs_profit / total_invested) * 100, 2) if total_invested > 0 else 0.0
+        # Period-specific profit and return calculation
+        period_inflows = sum(cf["amount"] for cf in all_cash_flows if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "OPENING_VALUATION"])
+        period_outflows = sum(abs(cf["amount"]) for cf in all_cash_flows if cf["type"] in ["REDEMPTION", "SWITCH_OUT"])
+        
+        period_net_gain = current_value - (period_inflows - period_outflows)
+        period_return_pct = round((period_net_gain / period_inflows) * 100, 2) if period_inflows > 0 else 0.0
         
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
-        benchmark_xirr = get_benchmark_return(first_date_str)
+        benchmark_xirr = get_benchmark_return(statement_start_date)
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
         return {
             "status": "success",
             "summary": {
-                "capital_invested": round(total_invested, 2),
+                "capital_invested": round(total_cost, 2),
                 "current_value": round(current_value, 2),
-                "opening_balance": round(opening_cost_total, 2), # Added Opening Balance
-                "absolute_profit": round(abs_profit, 2),
-                "absolute_return_pct": abs_return_pct,
+                "opening_balance": round(opening_cost_total, 2),
+                "absolute_profit": round(period_net_gain, 2),
+                "absolute_return_pct": period_return_pct,
                 "xirr": xirr,
                 "benchmark_xirr": benchmark_xirr,
                 "total_transactions": len(all_cash_flows)
