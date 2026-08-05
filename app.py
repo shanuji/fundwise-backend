@@ -8,7 +8,6 @@ import os
 import yfinance as yf
 import json
 import requests
-import difflib
 import re
 import threading
 
@@ -30,7 +29,6 @@ AMFI_MASTER_LIST = []
 AMFI_LOCK = threading.Lock()
 NAV_CACHE = {}
 
-# Load persistent scheme cache on startup
 if os.path.exists(SCHEME_CACHE_FILE):
     try:
         with open(SCHEME_CACHE_FILE, "r") as f:
@@ -103,7 +101,7 @@ def parse_flexible_date(date_str: str) -> str:
     return "2025-04-01"
 
 # ---------------------------------------------------------
-# DYNAMIC AMFI FUZZY MATCHING
+# DETERMINISTIC AMFI KEYWORD MATCHING
 # ---------------------------------------------------------
 def get_amfi_master():
     global AMFI_MASTER_LIST
@@ -124,12 +122,12 @@ def get_amfi_master():
             pass
         return AMFI_MASTER_LIST
 
-def clean_scheme_string(text: str) -> str:
+def get_base_keywords(text: str) -> set:
+    """Extracts strictly identifying base keywords by removing standard mutual fund jargon."""
     text = str(text).lower()
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    stopwords = {'direct', 'regular', 'plan', 'growth', 'option', 'idcw', 'non', 'demat', 'mutual', 'fund', 'advisor', 'dp', 'gr'}
-    words = [w for w in text.split() if w not in stopwords]
-    return " ".join(words)
+    stopwords = {'direct', 'regular', 'plan', 'growth', 'option', 'idcw', 'non', 'demat', 'mutual', 'fund', 'advisor', 'dp', 'gr', 'dividend', 'payout', 'reinvestment'}
+    return {w for w in text.split() if w not in stopwords and len(w) > 1}
 
 def find_scheme_code(cas_scheme_name: str, amfi_hint: str = "") -> str:
     if cas_scheme_name in SCHEME_NAME_TO_CODE:
@@ -144,24 +142,41 @@ def find_scheme_code(cas_scheme_name: str, amfi_hint: str = "") -> str:
     if not master:
         return None
 
-    clean_cas = clean_scheme_string(cas_scheme_name)
-    best_code = None
-    best_ratio = 0.0
+    cas_lower = cas_scheme_name.lower()
+    base_keywords = get_base_keywords(cas_scheme_name)
 
+    if not base_keywords:
+        return None
+
+    # Step 1: Exact subset matching (AMFI name must contain ALL base keywords)
+    candidates = []
     for item in master:
-        clean_amfi = clean_scheme_string(item["name"])
-        if clean_cas == clean_amfi:
-            best_code = item["code"]
-            break
-            
-        ratio = difflib.SequenceMatcher(None, clean_cas, clean_amfi).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_code = item["code"]
-            if ratio > 0.95:
-                break
+        amfi_lower = item["name"].lower()
+        if all(kw in amfi_lower for kw in base_keywords):
+            candidates.append(item)
 
-    if best_code:
+    # Step 2: Deterministic Tie-Breakers based on original CAS intent
+    if len(candidates) > 1:
+        # Prefer Direct vs Regular
+        if 'direct' in cas_lower or 'dir' in cas_lower.split() or 'dp' in cas_lower.split():
+            filtered = [c for c in candidates if 'direct' in c['name'].lower()]
+            if filtered: candidates = filtered
+        elif 'regular' in cas_lower or 'reg' in cas_lower.split():
+            filtered = [c for c in candidates if 'regular' in c['name'].lower()]
+            if filtered: candidates = filtered
+
+    if len(candidates) > 1:
+        # Prefer Growth vs IDCW/Dividend
+        if 'growth' in cas_lower or 'gr' in cas_lower.split():
+            filtered = [c for c in candidates if 'growth' in c['name'].lower()]
+            if filtered: candidates = filtered
+        elif 'idcw' in cas_lower or 'dividend' in cas_lower:
+            filtered = [c for c in candidates if 'idcw' in c['name'].lower() or 'dividend' in c['name'].lower()]
+            if filtered: candidates = filtered
+
+    # Step 3: Resolution Validation
+    if len(candidates) == 1:
+        best_code = candidates[0]["code"]
         SCHEME_NAME_TO_CODE[cas_scheme_name] = best_code
         save_scheme_cache()
         return best_code
@@ -338,7 +353,6 @@ async def parse_statement(
                     if fetched_nav:
                         opening_value = open_units * fetched_nav
                         
-                # Hard Fail on Missing NAV to protect math integrity
                 if opening_value is None and open_units > 0:
                     raise ValueError(f"Opening Market Value could not be determined accurately for {scheme_name}. NAV on {statement_start_str} is required.")
                 
