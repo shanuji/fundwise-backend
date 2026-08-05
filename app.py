@@ -10,7 +10,6 @@ import yfinance as yf
 
 app = FastAPI(title="FundWise Precision Engine")
 
-# Enable CORS for Flutter app requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,16 +43,13 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
         return round(npf.irr(amounts) * 100, 2)
 
 def get_benchmark_return(start_date_str: str) -> float:
-    """
-    Fetches Nifty 50 historical data via yfinance and computes annualized return.
-    """
     try:
         start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
         ticker = yf.Ticker("^NSEI")
         df = ticker.history(start=start_date_str)
         
         if df.empty:
-            return 14.0 # Fallback historical average
+            return 14.0 
             
         start_price = df['Close'].iloc[0]
         end_price = df['Close'].iloc[-1]
@@ -128,6 +124,7 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
 @app.post("/api/v1/parse-cas")
 async def parse_statement(
     file: UploadFile = File(...),
+    password: str = Form(""), # Defaults to empty string if left blank
     ltcg_rate: float = Form(12.5),
     stcg_rate: float = Form(20.0),
     exemption_limit: float = Form(125000.0),
@@ -142,7 +139,8 @@ async def parse_statement(
         tmp_path = tmp.name
 
     try:
-        data = casparser.read_cas_pdf(tmp_path, password="", output="dict")
+        # The engine applies the password. If it is "", it reads it as unprotected.
+        data = casparser.read_cas_pdf(tmp_path, password=password, output="dict")
         
         total_invested = 0.0
         current_value = 0.0
@@ -177,10 +175,7 @@ async def parse_statement(
         abs_profit = current_value - total_invested
         abs_return_pct = round((abs_profit / total_invested) * 100, 2) if total_invested > 0 else 0.0
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
-        
-        # Calculate Benchmark Return
         benchmark_xirr = get_benchmark_return(first_date_str)
-        
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
         return {
@@ -198,7 +193,8 @@ async def parse_statement(
         }
 
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Parsing error: {str(e)}")
+        # This will securely pass a clear message if the wrong password is provided
+        raise HTTPException(status_code=422, detail=f"CAS Parse Failed: {str(e)}")
 
     finally:
         if os.path.exists(tmp_path):
