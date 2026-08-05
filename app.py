@@ -8,8 +8,10 @@ import os
 import yfinance as yf
 import json
 import requests
+import re
+import threading
 
-app = FastAPI(title="FundWise Fault-Tolerant Engine")
+app = FastAPI(title="FundWise Strict Math Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,8 +23,26 @@ app.add_middleware(
 # ---------------------------------------------------------
 # GLOBAL CACHES
 # ---------------------------------------------------------
+SCHEME_CACHE_FILE = "scheme_cache.json"
+SCHEME_NAME_TO_CODE = {}
+AMFI_MASTER_LIST = []
+AMFI_LOCK = threading.Lock()
 NAV_CACHE = {}
 BENCHMARK_PRICE_CACHE = {}
+
+if os.path.exists(SCHEME_CACHE_FILE):
+    try:
+        with open(SCHEME_CACHE_FILE, "r") as f:
+            SCHEME_NAME_TO_CODE = json.load(f)
+    except Exception:
+        pass
+
+def save_scheme_cache():
+    try:
+        with open(SCHEME_CACHE_FILE, "w") as f:
+            json.dump(SCHEME_NAME_TO_CODE, f, indent=4)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------
 # TRANSACTION MAPPING & DATE PARSING
@@ -82,13 +102,84 @@ def parse_flexible_date(date_str: str) -> str:
     return "2025-04-01"
 
 # ---------------------------------------------------------
-# DETERMINISTIC NAV LOOKUP
+# DETERMINISTIC AMFI KEYWORD MATCHING
 # ---------------------------------------------------------
-def fetch_historical_nav_by_amfi(amfi_code: str, date_str: str) -> float:
-    if not amfi_code or str(amfi_code).strip().lower() == "none":
+def get_amfi_master():
+    global AMFI_MASTER_LIST
+    with AMFI_LOCK:
+        if AMFI_MASTER_LIST:
+            return AMFI_MASTER_LIST
+        try:
+            resp = requests.get("https://www.amfiindia.com/spages/NAVAll.txt", timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.split('\n'):
+                    parts = line.split(';')
+                    if len(parts) >= 6 and parts[0].strip().isdigit():
+                        AMFI_MASTER_LIST.append({
+                            "code": parts[0].strip(),
+                            "name": parts[3].strip()
+                        })
+        except Exception:
+            pass
+        return AMFI_MASTER_LIST
+
+def get_base_keywords(text: str) -> set:
+    text = str(text).lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    stopwords = {'direct', 'regular', 'plan', 'growth', 'option', 'idcw', 'non', 'demat', 'mutual', 'fund', 'advisor', 'dp', 'gr', 'dividend', 'payout', 'reinvestment'}
+    return {w for w in text.split() if w not in stopwords and len(w) > 1}
+
+def find_scheme_code(cas_scheme_name: str, amfi_hint: str = "") -> str:
+    if cas_scheme_name in SCHEME_NAME_TO_CODE:
+        return SCHEME_NAME_TO_CODE[cas_scheme_name]
+
+    if amfi_hint and amfi_hint.isdigit():
+        SCHEME_NAME_TO_CODE[cas_scheme_name] = amfi_hint
+        save_scheme_cache()
+        return amfi_hint
+
+    master = get_amfi_master()
+    if not master:
         return None
+
+    cas_lower = cas_scheme_name.lower()
+    base_keywords = get_base_keywords(cas_scheme_name)
+    if not base_keywords: return None
+
+    candidates = []
+    for item in master:
+        amfi_lower = item["name"].lower()
+        if all(kw in amfi_lower for kw in base_keywords):
+            candidates.append(item)
+
+    if len(candidates) > 1:
+        if 'direct' in cas_lower or 'dir' in cas_lower.split() or 'dp' in cas_lower.split():
+            filtered = [c for c in candidates if 'direct' in c['name'].lower()]
+            if filtered: candidates = filtered
+        elif 'regular' in cas_lower or 'reg' in cas_lower.split():
+            filtered = [c for c in candidates if 'regular' in c['name'].lower()]
+            if filtered: candidates = filtered
+
+    if len(candidates) > 1:
+        if 'growth' in cas_lower or 'gr' in cas_lower.split():
+            filtered = [c for c in candidates if 'growth' in c['name'].lower()]
+            if filtered: candidates = filtered
+        elif 'idcw' in cas_lower or 'dividend' in cas_lower:
+            filtered = [c for c in candidates if 'idcw' in c['name'].lower() or 'dividend' in c['name'].lower()]
+            if filtered: candidates = filtered
+
+    if len(candidates) == 1:
+        best_code = candidates[0]["code"]
+        SCHEME_NAME_TO_CODE[cas_scheme_name] = best_code
+        save_scheme_cache()
+        return best_code
+
+    return None
+
+def fetch_historical_nav(scheme_name: str, date_str: str, amfi_hint: str = "") -> float:
+    scheme_code = find_scheme_code(scheme_name, amfi_hint)
+    if not scheme_code: return None
         
-    scheme_code = str(amfi_code).strip()
     target_dt = datetime.strptime(date_str, "%Y-%m-%d")
     
     if scheme_code not in NAV_CACHE:
@@ -118,47 +209,44 @@ def fetch_historical_nav_by_amfi(amfi_code: str, date_str: str) -> float:
 # MONEY-WEIGHTED BENCHMARK SIMULATOR
 # ---------------------------------------------------------
 def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
-    """Fetches and caches Nifty 50 closing prices for the required statement window."""
-    try:
-        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10) # Pad for initial lookup
-        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=2)
-        
-        cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
-        if cache_key in BENCHMARK_PRICE_CACHE:
-            return BENCHMARK_PRICE_CACHE[cache_key]
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10)
+    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=2)
+    cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
+    
+    if cache_key in BENCHMARK_PRICE_CACHE:
+        return BENCHMARK_PRICE_CACHE[cache_key]
 
-        ticker = yf.Ticker("^NSEI")
-        df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
+    ticker = yf.Ticker("^NSEI")
+    df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
+    
+    if df.empty or len(df) == 0:
+        raise ValueError(f"Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
         
-        price_dict = {}
-        if not df.empty:
-            for index, row in df.iterrows():
-                price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
-                
-        BENCHMARK_PRICE_CACHE[cache_key] = price_dict
-        return price_dict
-    except Exception:
-        return {}
+    price_dict = {}
+    for index, row in df.iterrows():
+        price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
+        
+    BENCHMARK_PRICE_CACHE[cache_key] = price_dict
+    print(f"[Benchmark Setup] Successfully downloaded {len(price_dict)} daily prices from YFinance.")
+    return price_dict
 
 def get_closest_benchmark_price(date_str: str, price_dict: dict) -> float:
-    """Walks backward up to 10 days to find the nearest closing price for weekends/holidays."""
     target_dt = datetime.strptime(date_str, "%Y-%m-%d")
     for i in range(10):
         check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
         if check_str in price_dict:
             return price_dict[check_str]
     
-    # Absolute fallback to latest available if gap is massive
-    if price_dict:
-        return list(price_dict.values())[-1]
-    return 1.0
+    raise ValueError(f"Could not find any benchmark price within 10 days of {date_str}. Missing market data.")
 
 # ---------------------------------------------------------
-# MATHEMATICAL SOLVER (-99% to +200%)
+# STRICT MATHEMATICAL SOLVER (-99% to +200%)
 # ---------------------------------------------------------
-def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> float:
-    if not cf_data or closing_market_value <= 0:
-        return 0.0
+def solve_annualized_rate(cf_data: list[dict], closing_market_value: float, context="Solver") -> float:
+    if not cf_data:
+        raise ValueError(f"[{context}] Failed: No cash flows provided to the solver.")
+    if closing_market_value <= 0:
+        raise ValueError(f"[{context}] Failed: Invalid closing market value ({closing_market_value}).")
 
     def return_func(r):
         return sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data) - closing_market_value
@@ -171,31 +259,40 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> f
                 deriv += item["amount"] * t * ((1.0 + r) ** (t - 1.0))
         return deriv
 
+    # 1. Newton
     try:
         rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=500)
         if not isinstance(rate, complex) and -0.99 <= rate <= 2.0:
             return round(float(rate) * 100, 2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[{context}] Newton solver failed to converge: {e}")
 
+    # 2. Brent
     try:
         rate = brentq(return_func, -0.99, 2.0, maxiter=500)
         return round(float(rate) * 100, 2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[{context}] Brentq solver failed to converge: {e}")
 
+    # 3. Binary Search
     low, high = -0.99, 2.0
     mid = 0.0
+    val = 0.0
     for _ in range(100):
         mid = (low + high) / 2.0
         val = return_func(mid)
-        if abs(val) < 1e-5:
+        if abs(val) < 1e-4:
             return round(mid * 100, 2)
         if val > 0:
             high = mid
         else:
             low = mid
             
+    if abs(val) > 1.0: # If the mathematical residual is off by more than 1 Rupee
+        error_msg = f"[{context}] Binary search failed to converge. Final residual gap: {val}, Rate bounded between {low} and {high}."
+        print(error_msg)
+        raise ValueError(error_msg)
+        
     return round(mid * 100, 2)
 
 # ---------------------------------------------------------
@@ -248,13 +345,32 @@ async def parse_statement(
                 scheme_name = scheme.get("scheme", "Unknown Fund")
                 valuation = scheme.get("valuation") or {}
                 closing_value = float(valuation.get("value", 0.0) or 0.0)
-                closing_cost = float(valuation.get("cost", 0.0) or 0.0)
+                
+                opening_value = None
                 open_units = float(scheme.get("open", 0.0))
+                
+                if "opening_value" in scheme and scheme["opening_value"] is not None:
+                    opening_value = float(scheme["opening_value"])
+                
+                if opening_value is None and open_units > 0:
+                    if "open_nav" in scheme and scheme["open_nav"]:
+                        opening_value = open_units * float(scheme["open_nav"])
+                        
+                if opening_value is None and open_units > 0:
+                    amfi_code = scheme.get("amfi", "")
+                    fetched_nav = fetch_historical_nav(scheme_name, statement_start_str, amfi_code)
+                    if fetched_nav:
+                        opening_value = open_units * fetched_nav
+                        
+                if opening_value is None and open_units > 0:
+                    raise ValueError(f"Opening Market Value could not be determined for {scheme_name}. NAV on {statement_start_str} is required.")
+                
+                if opening_value is None:
+                    opening_value = 0.0
                 
                 fund_investments = 0.0
                 fund_redemptions = 0.0
                 tx_list = []
-                first_tx_nav = None
                 
                 for tx in scheme.get("transactions", []):
                     tx_date_str = parse_flexible_date(str(tx.get("date", "")))
@@ -271,51 +387,7 @@ async def parse_statement(
                             elif tx_dir == -1:
                                 fund_redemptions += amt_abs
                                 tx_list.append({"date": tx_date_str, "amount": -amt_abs})
-                        
-                        if first_tx_nav is None and tx.get("nav"):
-                            try:
-                                nav_val = float(tx["nav"])
-                                if nav_val > 0:
-                                    first_tx_nav = nav_val
-                            except ValueError:
-                                pass
-
-                # RESOLUTION WATERFALL
-                opening_value = None
-                resolution_path = ""
-
-                if open_units == 0:
-                    opening_value = 0.0
-                    resolution_path = "Zero Opening Balance"
-
-                if opening_value is None and scheme.get("opening_value") is not None:
-                    opening_value = float(scheme["opening_value"])
-                    resolution_path = "CAS Explicit Opening Value"
-
-                if opening_value is None and scheme.get("open_nav"):
-                    opening_value = open_units * float(scheme["open_nav"])
-                    resolution_path = f'CAS Explicit Opening NAV ({scheme["open_nav"]})'
-
-                if opening_value is None and scheme.get("amfi"):
-                    amfi_code = str(scheme.get("amfi")).strip()
-                    fetched_nav = fetch_historical_nav_by_amfi(amfi_code, statement_start_str)
-                    if fetched_nav:
-                        opening_value = open_units * fetched_nav
-                        resolution_path = f"MFAPI Official AMFI Lookup ({fetched_nav})"
-
-                if opening_value is None and first_tx_nav is not None:
-                    opening_value = open_units * first_tx_nav
-                    resolution_path = f"Fallback 1: Earliest Transaction NAV ({first_tx_nav})"
-
-                if opening_value is None:
-                    estimated_cost = closing_cost - (fund_investments - fund_redemptions)
-                    opening_value = max(0.0, estimated_cost)
-                    resolution_path = "Fallback 2: Reconstructed Historical Cost (ESTIMATED)"
-                
-                print(f"[FundWise Resolver] Scheme: {scheme_name}")
-                print(f"[FundWise Resolver] - Resolution Path: {resolution_path}")
-                print(f"[FundWise Resolver] - Final Derived Opening Value: {opening_value}\n")
-
+                            
                 fund_cash_flows = []
                 if opening_value > 0:
                     fund_cash_flows.append({
@@ -333,7 +405,7 @@ async def parse_statement(
                     cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
                     holding_days = max(0, (statement_end_dt - cf_date).days)
                     cf_data.append({"amount": cf["amount"], "days": holding_days})
-                statement_annualized_return = solve_annualized_rate(cf_data, closing_value)
+                statement_annualized_return = solve_annualized_rate(cf_data, closing_value, context=f"Fund: {scheme_name}")
 
                 funds_breakdown.append({
                     "scheme_name": scheme_name,
@@ -342,8 +414,7 @@ async def parse_statement(
                     "current_value": round(closing_value, 2),
                     "absolute_profit": round(absolute_profit, 2),
                     "absolute_return_pct": absolute_return_pct,
-                    "statement_annualized_return": statement_annualized_return,
-                    "resolution_path": resolution_path 
+                    "statement_annualized_return": statement_annualized_return
                 })
 
                 portfolio_opening_value += opening_value
@@ -362,28 +433,41 @@ async def parse_statement(
             holding_days = max(0, (statement_end_dt - cf_date).days)
             port_cf_data.append({"amount": cf["amount"], "days": holding_days})
             
-        portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value)
+        portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
         
         # ---------------------------------------------------------
-        # APPLES-TO-APPLES MONEY-WEIGHTED BENCHMARK
+        # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION
         # ---------------------------------------------------------
+        print("\n=== STARTING BENCHMARK SIMULATION ===")
+        print(f"Total Portfolio Cash Flows: {len(portfolio_cash_flows)}")
+        
         benchmark_prices = fetch_benchmark_prices(statement_start_str, statement_end_str)
         benchmark_units = 0.0
         
-        # Simulate benchmark unit accumulation based on exact identical cash flows
         for cf in portfolio_cash_flows:
             cf_date = cf["date"]
-            cf_amount = cf["amount"]
-            nav = get_closest_benchmark_price(cf_date, benchmark_prices)
+            cf_amount = cf["amount"] # Signed implicitly (+ for inflow, - for outflow)
             
-            if nav > 0:
-                benchmark_units += (cf_amount / nav)
+            nav = get_closest_benchmark_price(cf_date, benchmark_prices)
+            units_transacted = cf_amount / nav
+            benchmark_units += units_transacted
+            
+            direction = "BOUGHT" if cf_amount > 0 else "SOLD"
+            print(f"[Benchmark] Date: {cf_date} | {direction} with CF: {cf_amount} | Nifty50 NAV: {nav} | Units: {units_transacted} | Balance: {benchmark_units}")
                 
         final_benchmark_nav = get_closest_benchmark_price(statement_end_str, benchmark_prices)
         benchmark_simulated_closing_value = max(0.0, benchmark_units * final_benchmark_nav)
         
-        # Solve for the benchmark's return using the identical port_cf_data array
-        benchmark_annualized = solve_annualized_rate(port_cf_data, benchmark_simulated_closing_value)
+        print(f"=== SIMULATION COMPLETE ===")
+        print(f"Final Benchmark Units: {benchmark_units}")
+        print(f"Final Benchmark NAV: {final_benchmark_nav}")
+        print(f"Benchmark Simulated Closing Value: {benchmark_simulated_closing_value}")
+        
+        if benchmark_simulated_closing_value <= 0:
+            raise ValueError(f"Benchmark simulation failed: Final closing value is {benchmark_simulated_closing_value} (Units: {benchmark_units}).")
+
+        benchmark_annualized = solve_annualized_rate(port_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
+        print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
 
         return {
             "status": "success",
@@ -403,6 +487,9 @@ async def parse_statement(
             "funds_breakdown": funds_breakdown
         }
 
+    except ValueError as ve:
+        # Directly bubble up mathematical/simulation failures to the API response
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"CAS Parse Failed: {str(e)}")
 
