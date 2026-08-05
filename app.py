@@ -8,10 +8,8 @@ import os
 import yfinance as yf
 import json
 import requests
-import re
-import threading
 
-app = FastAPI(title="FundWise Strict Math Engine")
+app = FastAPI(title="FundWise Isolated Benchmark Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,31 +19,13 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------
-# GLOBAL CACHES & THREAD LOCKS
+# GLOBAL CACHES
 # ---------------------------------------------------------
-SCHEME_CACHE_FILE = "scheme_cache.json"
-SCHEME_NAME_TO_CODE = {}
-AMFI_MASTER_LIST = []
-AMFI_LOCK = threading.Lock()
 NAV_CACHE = {}
 BENCHMARK_PRICE_CACHE = {}
 
-if os.path.exists(SCHEME_CACHE_FILE):
-    try:
-        with open(SCHEME_CACHE_FILE, "r") as f:
-            SCHEME_NAME_TO_CODE = json.load(f)
-    except Exception:
-        pass
-
-def save_scheme_cache():
-    try:
-        with open(SCHEME_CACHE_FILE, "w") as f:
-            json.dump(SCHEME_NAME_TO_CODE, f, indent=4)
-    except Exception:
-        pass
-
 # ---------------------------------------------------------
-# TRANSACTION MAPPING & DATE PARSING
+# TRANSACTION MAPPING & DATE PARSING (RESTORED)
 # ---------------------------------------------------------
 TXN_MAP = {
     "PURCHASE": 1,
@@ -55,6 +35,8 @@ TXN_MAP = {
     "LUMPSUM": 1,
     "SWITCH IN": 1,
     "STP IN": 1,
+    "DIVIDEND REINVESTMENT": 1,
+    "DIVIDEND REINVEST": 1,
     
     "REDEMPTION": -1,
     "SWITCH OUT": -1,
@@ -62,9 +44,6 @@ TXN_MAP = {
     "SWP": -1,
     "DIVIDEND PAYOUT": -1,
     
-    # Neutral events that do not inject or remove external capital
-    "DIVIDEND REINVESTMENT": 0,
-    "DIVIDEND REINVEST": 0,
     "SEGREGATION": 0,
     "MERGER": 0,
     "REVERSE MERGER": 0,
@@ -103,84 +82,14 @@ def parse_flexible_date(date_str: str) -> str:
     return "2025-04-01"
 
 # ---------------------------------------------------------
-# DETERMINISTIC AMFI KEYWORD MATCHING
+# DETERMINISTIC NAV LOOKUP (FAULT-TOLERANT LOGIC RESTORED)
 # ---------------------------------------------------------
-def get_amfi_master():
-    global AMFI_MASTER_LIST
-    with AMFI_LOCK:
-        if AMFI_MASTER_LIST:
-            return AMFI_MASTER_LIST
-        try:
-            resp = requests.get("https://www.amfiindia.com/spages/NAVAll.txt", timeout=10)
-            if resp.status_code == 200:
-                for line in resp.text.split('\n'):
-                    parts = line.split(';')
-                    if len(parts) >= 6 and parts[0].strip().isdigit():
-                        AMFI_MASTER_LIST.append({
-                            "code": parts[0].strip(),
-                            "name": parts[3].strip()
-                        })
-        except Exception:
-            pass
-        return AMFI_MASTER_LIST
-
-def get_base_keywords(text: str) -> set:
-    text = str(text).lower()
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    stopwords = {'direct', 'regular', 'plan', 'growth', 'option', 'idcw', 'non', 'demat', 'mutual', 'fund', 'advisor', 'dp', 'gr', 'dividend', 'payout', 'reinvestment'}
-    return {w for w in text.split() if w not in stopwords and len(w) > 1}
-
-def find_scheme_code(cas_scheme_name: str, amfi_hint: str = "") -> str:
-    if cas_scheme_name in SCHEME_NAME_TO_CODE:
-        return SCHEME_NAME_TO_CODE[cas_scheme_name]
-
-    if amfi_hint and amfi_hint.isdigit():
-        SCHEME_NAME_TO_CODE[cas_scheme_name] = amfi_hint
-        save_scheme_cache()
-        return amfi_hint
-
-    master = get_amfi_master()
-    if not master:
+def fetch_historical_nav_by_amfi(amfi_code: str, date_str: str) -> float:
+    """Strictly fetches historical NAV using the official AMFI code. No text matching."""
+    if not amfi_code or str(amfi_code).strip().lower() == "none":
         return None
-
-    cas_lower = cas_scheme_name.lower()
-    base_keywords = get_base_keywords(cas_scheme_name)
-    if not base_keywords: return None
-
-    candidates = []
-    for item in master:
-        amfi_lower = item["name"].lower()
-        if all(kw in amfi_lower for kw in base_keywords):
-            candidates.append(item)
-
-    if len(candidates) > 1:
-        if 'direct' in cas_lower or 'dir' in cas_lower.split() or 'dp' in cas_lower.split():
-            filtered = [c for c in candidates if 'direct' in c['name'].lower()]
-            if filtered: candidates = filtered
-        elif 'regular' in cas_lower or 'reg' in cas_lower.split():
-            filtered = [c for c in candidates if 'regular' in c['name'].lower()]
-            if filtered: candidates = filtered
-
-    if len(candidates) > 1:
-        if 'growth' in cas_lower or 'gr' in cas_lower.split():
-            filtered = [c for c in candidates if 'growth' in c['name'].lower()]
-            if filtered: candidates = filtered
-        elif 'idcw' in cas_lower or 'dividend' in cas_lower:
-            filtered = [c for c in candidates if 'idcw' in c['name'].lower() or 'dividend' in c['name'].lower()]
-            if filtered: candidates = filtered
-
-    if len(candidates) == 1:
-        best_code = candidates[0]["code"]
-        SCHEME_NAME_TO_CODE[cas_scheme_name] = best_code
-        save_scheme_cache()
-        return best_code
-
-    return None
-
-def fetch_historical_nav(scheme_name: str, date_str: str, amfi_hint: str = "") -> float:
-    scheme_code = find_scheme_code(scheme_name, amfi_hint)
-    if not scheme_code: return None
         
+    scheme_code = str(amfi_code).strip()
     target_dt = datetime.strptime(date_str, "%Y-%m-%d")
     
     if scheme_code not in NAV_CACHE:
@@ -199,59 +108,13 @@ def fetch_historical_nav(scheme_name: str, date_str: str, amfi_hint: str = "") -
             
     scheme_navs = NAV_CACHE.get(scheme_code, {})
     
+    # 7-Day Lookback for weekends and holidays
     for i in range(8):
         check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
         if check_str in scheme_navs:
             return scheme_navs[check_str]
             
     return None
-
-# ---------------------------------------------------------
-# MONEY-WEIGHTED BENCHMARK SIMULATOR
-# ---------------------------------------------------------
-def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
-    try:
-        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10)
-        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=5)
-        cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
-        
-        if cache_key in BENCHMARK_PRICE_CACHE:
-            return BENCHMARK_PRICE_CACHE[cache_key]
-
-        ticker = yf.Ticker("^NSEI")
-        df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
-        
-        if df.empty or len(df) == 0:
-            print(f"[Warning] Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
-            return {}
-            
-        price_dict = {}
-        for index, row in df.iterrows():
-            price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
-            
-        BENCHMARK_PRICE_CACHE[cache_key] = price_dict
-        print(f"[Benchmark Setup] Successfully downloaded {len(price_dict)} daily prices from YFinance.")
-        return price_dict
-    except Exception as e:
-        print(f"[Error] Failed to fetch benchmark prices: {e}")
-        return {}
-
-def get_closest_benchmark_price(date_str: str, price_dict: dict) -> float:
-    target_dt = datetime.strptime(date_str, "%Y-%m-%d")
-    
-    # 1. Walk FORWARD to simulate Next-Business-Day execution
-    for i in range(5):
-        check_str = (target_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-        if check_str in price_dict:
-            return price_dict[check_str]
-            
-    # 2. Walk BACKWARD only as a fallback
-    for i in range(1, 10):
-        check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
-        if check_str in price_dict:
-            return price_dict[check_str]
-    
-    raise ValueError(f"Could not find any benchmark price near {date_str}. Missing market data.")
 
 # ---------------------------------------------------------
 # STRICT MATHEMATICAL SOLVER (-99% to +200%)
@@ -305,6 +168,54 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float, cont
         raise ValueError(error_msg)
         
     return round(mid * 100, 2)
+
+# ---------------------------------------------------------
+# ISOLATED BENCHMARK SIMULATOR
+# ---------------------------------------------------------
+def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10)
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=5)
+        cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
+        
+        if cache_key in BENCHMARK_PRICE_CACHE:
+            return BENCHMARK_PRICE_CACHE[cache_key]
+
+        ticker = yf.Ticker("^NSEI")
+        df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
+        
+        if df.empty or len(df) == 0:
+            print(f"[Warning] Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
+            return {}
+            
+        price_dict = {}
+        for index, row in df.iterrows():
+            price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
+            
+        BENCHMARK_PRICE_CACHE[cache_key] = price_dict
+        print(f"[Benchmark Setup] Successfully downloaded {len(price_dict)} daily prices from YFinance.")
+        return price_dict
+    except Exception as e:
+        print(f"[Error] Failed to fetch benchmark prices: {e}")
+        return {}
+
+def get_closest_benchmark_price(date_str: str, price_dict: dict) -> float:
+    target_dt = datetime.strptime(date_str, "%Y-%m-%d")
+    
+    # 1. Walk FORWARD to simulate Next-Business-Day execution
+    for i in range(5):
+        check_str = (target_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+        if check_str in price_dict:
+            return price_dict[check_str]
+            
+    # 2. Walk BACKWARD only as a fallback
+    for i in range(1, 10):
+        check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
+        if check_str in price_dict:
+            return price_dict[check_str]
+    
+    raise ValueError(f"Could not find any benchmark price near {date_str}. Missing market data.")
+
 
 # ---------------------------------------------------------
 # API ENDPOINT
@@ -388,7 +299,9 @@ async def parse_statement(
                             except ValueError:
                                 pass
 
-                # RESOLUTION WATERFALL
+                # ---------------------------------------------------------
+                # RESOLUTION WATERFALL (RESTORED TO ORIGINAL FAULT-TOLERANT)
+                # ---------------------------------------------------------
                 opening_value = None
                 resolution_path = ""
 
@@ -404,9 +317,9 @@ async def parse_statement(
                     opening_value = open_units * float(scheme["open_nav"])
                     resolution_path = f'CAS Explicit Opening NAV ({scheme["open_nav"]})'
 
-                if opening_value is None:
-                    amfi_code = str(scheme.get("amfi", "")).strip()
-                    fetched_nav = fetch_historical_nav(scheme_name, statement_start_str, amfi_code)
+                if opening_value is None and scheme.get("amfi"):
+                    amfi_code = str(scheme.get("amfi")).strip()
+                    fetched_nav = fetch_historical_nav_by_amfi(amfi_code, statement_start_str)
                     if fetched_nav:
                         opening_value = open_units * fetched_nav
                         resolution_path = f"MFAPI Official AMFI Lookup ({fetched_nav})"
@@ -480,7 +393,7 @@ async def parse_statement(
             portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
         
         # ---------------------------------------------------------
-        # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION (GRACEFUL DEGRADATION)
+        # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION (COMPLETELY ISOLATED)
         # ---------------------------------------------------------
         print("\n=== STARTING BENCHMARK SIMULATION ===")
         print(f"Total Portfolio Cash Flows: {len(portfolio_cash_flows)}")
