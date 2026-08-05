@@ -22,8 +22,6 @@ def parse_flexible_date(date_str: str) -> str:
     if not date_str:
         return "2025-04-01"
     cleaned = str(date_str).strip()
-    
-    # Fix potential truncated years like '01-Apr-202' -> '01-Apr-2025'
     if len(cleaned) == 10 and cleaned.endswith("202"):
         cleaned += "5"
     elif len(cleaned) == 9 and cleaned.endswith("20"):
@@ -36,7 +34,6 @@ def parse_flexible_date(date_str: str) -> str:
             return dt.strftime("%Y-%m-%d")
         except ValueError:
             continue
-            
     return "2025-04-01"
 
 def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date: datetime) -> float:
@@ -44,7 +41,7 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
         return 0.0
 
     dates = [datetime.strptime(parse_flexible_date(cf["date"]), "%Y-%m-%d") for cf in cash_flows]
-    amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "OPENING_VALUATION"] else abs(cf["amount"]) for cf in cash_flows]
+    amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "DIVIDEND_REINVEST", "OPENING_VALUATION"] else abs(cf["amount"]) for cf in cash_flows]
 
     dates.append(end_date)
     amounts.append(current_market_value)
@@ -107,7 +104,7 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
                 
             date_obj = datetime.strptime(parse_flexible_date(tx["date"]), "%Y-%m-%d")
                 
-            if t_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
+            if t_type in ["PURCHASE", "SIP", "DIVIDEND_REINVEST"]:
                 buy_queue.append({'date': date_obj, 'units': float(units), 'nav': float(nav)})
             
             elif t_type in ["REDEMPTION", "SWITCH_OUT"]:
@@ -206,7 +203,8 @@ async def parse_statement(
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
                     if tx_date >= statement_start_date:
-                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
+                        # Exclude internal switch-ins from external new capital deployed
+                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "DIVIDEND_REINVEST"]:
                             amt = float(tx["amount"])
                             period_inflows += amt
                             all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
