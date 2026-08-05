@@ -1,0 +1,33 @@
+name: Run Initial Backfill
+
+on:
+  workflow_dispatch: # Allows you to trigger this manually with a button
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas
+
+      - name: Run backfill script
+        run: python backfill.py
+
+      - name: Commit and push the JSON database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add nifty50_history.json
+          git commit -m "Generated 10-year benchmark database"
+          git push
