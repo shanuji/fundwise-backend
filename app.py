@@ -1,4 +1,4 @@
-   from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import casparser
 from scipy.optimize import newton, brentq
