@@ -210,26 +210,31 @@ def fetch_historical_nav(scheme_name: str, date_str: str, amfi_hint: str = "") -
 # MONEY-WEIGHTED BENCHMARK SIMULATOR
 # ---------------------------------------------------------
 def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
-    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10)
-    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=5)
-    cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
-    
-    if cache_key in BENCHMARK_PRICE_CACHE:
-        return BENCHMARK_PRICE_CACHE[cache_key]
+    try:
+        start_dt = datetime.strptime(start_date_str, "%Y-%m-%d") - timedelta(days=10)
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=5)
+        cache_key = f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}"
+        
+        if cache_key in BENCHMARK_PRICE_CACHE:
+            return BENCHMARK_PRICE_CACHE[cache_key]
 
-    ticker = yf.Ticker("^NSEI")
-    df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
-    
-    if df.empty or len(df) == 0:
-        raise ValueError(f"Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
+        ticker = yf.Ticker("^NSEI")
+        df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
         
-    price_dict = {}
-    for index, row in df.iterrows():
-        price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
-        
-    BENCHMARK_PRICE_CACHE[cache_key] = price_dict
-    print(f"[Benchmark Setup] Successfully downloaded {len(price_dict)} daily prices from YFinance.")
-    return price_dict
+        if df.empty or len(df) == 0:
+            print(f"[Warning] Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
+            return {}
+            
+        price_dict = {}
+        for index, row in df.iterrows():
+            price_dict[index.strftime("%Y-%m-%d")] = float(row['Close'])
+            
+        BENCHMARK_PRICE_CACHE[cache_key] = price_dict
+        print(f"[Benchmark Setup] Successfully downloaded {len(price_dict)} daily prices from YFinance.")
+        return price_dict
+    except Exception as e:
+        print(f"[Error] Failed to fetch benchmark prices: {e}")
+        return {}
 
 def get_closest_benchmark_price(date_str: str, price_dict: dict) -> float:
     target_dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -437,7 +442,6 @@ async def parse_statement(
                     holding_days = max(0, (statement_end_dt - cf_date).days)
                     cf_data.append({"amount": cf["amount"], "days": holding_days})
                 
-                # BUGFIX: Prevent solver crash on zero/negative closing value or inactive funds
                 if not cf_data or closing_value <= 0:
                     statement_annualized_return = None
                 else:
@@ -470,14 +474,13 @@ async def parse_statement(
             holding_days = max(0, (statement_end_dt - cf_date).days)
             port_cf_data.append({"amount": cf["amount"], "days": holding_days})
             
-        # BUGFIX: Safeguard portfolio solver on zero/negative closing value
         if not port_cf_data or portfolio_current_value <= 0:
             portfolio_annualized_return = None
         else:
             portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
         
         # ---------------------------------------------------------
-        # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION
+        # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION (GRACEFUL DEGRADATION)
         # ---------------------------------------------------------
         print("\n=== STARTING BENCHMARK SIMULATION ===")
         print(f"Total Portfolio Cash Flows: {len(portfolio_cash_flows)}")
@@ -485,47 +488,57 @@ async def parse_statement(
         benchmark_prices = fetch_benchmark_prices(statement_start_str, statement_end_str)
         benchmark_units = 0.0
         benchmark_cf_data = []
+        benchmark_annualized = None
+        benchmark_status = "Available"
         
-        for cf in portfolio_cash_flows:
-            cf_date = cf["date"]
-            cf_amount = cf["amount"] 
-            
-            if cf_amount == 0:
-                continue
-                
-            nav = get_closest_benchmark_price(cf_date, benchmark_prices)
-            units_transacted = cf_amount / nav
-            realized_cf_amount = cf_amount
-            
-            if units_transacted < 0 and abs(units_transacted) > benchmark_units:
-                units_transacted = -benchmark_units 
-                realized_cf_amount = units_transacted * nav 
-                print(f"[Warning] Benchmark capital depleted. Capping withdrawal on {cf_date}.")
-                
-            benchmark_units += units_transacted
-            
-            cf_date_obj = datetime.strptime(cf_date, "%Y-%m-%d")
-            holding_days = max(0, (statement_end_dt - cf_date_obj).days)
-            benchmark_cf_data.append({"amount": realized_cf_amount, "days": holding_days})
-            
-            direction = "BOUGHT" if cf_amount > 0 else "SOLD"
-            print(f"[Benchmark] Date: {cf_date} | {direction} | Nifty50 NAV: {nav} | Units: {units_transacted} | Balance: {benchmark_units}")
-                
-        final_benchmark_nav = get_closest_benchmark_price(statement_end_str, benchmark_prices)
-        benchmark_simulated_closing_value = benchmark_units * final_benchmark_nav
-        
-        print(f"=== SIMULATION COMPLETE ===")
-        print(f"Final Benchmark Units: {benchmark_units}")
-        print(f"Final Benchmark NAV: {final_benchmark_nav}")
-        print(f"Benchmark Simulated Closing Value: {benchmark_simulated_closing_value}")
-
-        # BUGFIX: Safeguard benchmark solver on zero/negative closing value
-        if not benchmark_cf_data or benchmark_simulated_closing_value <= 0:
-            benchmark_annualized = None
-            print("Benchmark Annualized Return: None (Zero/Negative Closing Value or No CFs)\n")
+        if not benchmark_prices:
+            print("[Warning] Benchmark prices unavailable. Bypassing benchmark simulation.")
+            benchmark_status = "Unavailable"
         else:
-            benchmark_annualized = solve_annualized_rate(benchmark_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
-            print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
+            try:
+                for cf in portfolio_cash_flows:
+                    cf_date = cf["date"]
+                    cf_amount = cf["amount"] 
+                    
+                    if cf_amount == 0:
+                        continue
+                        
+                    nav = get_closest_benchmark_price(cf_date, benchmark_prices)
+                    units_transacted = cf_amount / nav
+                    realized_cf_amount = cf_amount
+                    
+                    if units_transacted < 0 and abs(units_transacted) > benchmark_units:
+                        units_transacted = -benchmark_units 
+                        realized_cf_amount = units_transacted * nav 
+                        print(f"[Warning] Benchmark capital depleted. Capping withdrawal on {cf_date}.")
+                        
+                    benchmark_units += units_transacted
+                    
+                    cf_date_obj = datetime.strptime(cf_date, "%Y-%m-%d")
+                    holding_days = max(0, (statement_end_dt - cf_date_obj).days)
+                    benchmark_cf_data.append({"amount": realized_cf_amount, "days": holding_days})
+                    
+                    direction = "BOUGHT" if cf_amount > 0 else "SOLD"
+                    print(f"[Benchmark] Date: {cf_date} | {direction} | Nifty50 NAV: {nav} | Units: {units_transacted} | Balance: {benchmark_units}")
+                        
+                final_benchmark_nav = get_closest_benchmark_price(statement_end_str, benchmark_prices)
+                benchmark_simulated_closing_value = benchmark_units * final_benchmark_nav
+                
+                print(f"=== SIMULATION COMPLETE ===")
+                print(f"Final Benchmark Units: {benchmark_units}")
+                print(f"Final Benchmark NAV: {final_benchmark_nav}")
+                print(f"Benchmark Simulated Closing Value: {benchmark_simulated_closing_value}")
+
+                if not benchmark_cf_data or benchmark_simulated_closing_value <= 0:
+                    benchmark_annualized = None
+                    print("Benchmark Annualized Return: None (Zero/Negative Closing Value or No CFs)\n")
+                else:
+                    benchmark_annualized = solve_annualized_rate(benchmark_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
+                    print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
+            except Exception as e:
+                print(f"[Error] Benchmark simulation failed during execution: {e}")
+                benchmark_annualized = None
+                benchmark_status = "Unavailable"
 
         return {
             "status": "success",
@@ -540,7 +553,8 @@ async def parse_statement(
                 "total_profit": round(total_profit, 2),
                 "absolute_return_pct": portfolio_abs_return_pct,
                 "statement_annualized_return": portfolio_annualized_return,
-                "benchmark_annualized_return": benchmark_annualized
+                "benchmark_annualized_return": benchmark_annualized,
+                "benchmark_status": benchmark_status
             },
             "funds_breakdown": funds_breakdown
         }
