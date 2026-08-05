@@ -148,8 +148,9 @@ async def parse_statement(
         data = json.loads(raw_json_str)
         
         current_value = 0.0
-        total_cost = 0.0
         opening_cost_total = 0.0
+        period_inflows = 0.0
+        period_outflows = 0.0
         all_cash_flows = []
         schemes_data = []
         statement_start_date = "2025-04-01"
@@ -165,14 +166,11 @@ async def parse_statement(
                 valuation = scheme.get("valuation") or {}
                 
                 val_amount = float(valuation.get("value", 0.0) or 0.0)
-                cost_amount = float(valuation.get("cost", 0.0) or 0.0)
                 opening_cost = float(valuation.get("opening", 0.0) or 0.0)
                 
                 current_value += val_amount
-                total_cost += cost_amount
                 opening_cost_total += opening_cost
 
-                # Inject opening balance as day-1 cash flow for period XIRR
                 if opening_cost > 0:
                     all_cash_flows.append({
                         "date": statement_start_date,
@@ -185,18 +183,24 @@ async def parse_statement(
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
                     if tx_date >= statement_start_date:
-                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
+                        if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
                             amt = float(tx["amount"])
-                            all_cash_flows.append({
-                                "date": tx_date,
-                                "amount": amt,
-                                "type": tx_type
-                            })
+                            period_inflows += amt
+                            all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
+                        elif tx.get("amount") and tx_type in ["REDEMPTION", "SWITCH_OUT"]:
+                            amt = float(tx["amount"])
+                            period_outflows += abs(amt)
+                            all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
 
-        # Period-specific profit calculations matching your breakdown
-        net_inflows = opening_cost_total + sum(cf["amount"] for cf in all_cash_flows if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"])
-        absolute_profit = current_value - total_cost
-        absolute_return_pct = round((absolute_profit / total_cost) * 100, 2) if total_cost > 0 else 0.0
+        # STRICT STATEMENT PERIOD FORMULA:
+        # Total Active Corpus Base for the period = Opening Balance + Period Inflows
+        total_period_corpus = opening_cost_total + period_inflows
+        
+        # Period Profit = Current Value minus (Opening Balance + Net Inflows)
+        absolute_profit = current_value - (total_period_corpus - period_outflows)
+        
+        # Absolute Return Percentage strictly for the period
+        absolute_return_pct = round((absolute_profit / total_period_corpus) * 100, 2) if total_period_corpus > 0 else 0.0
         
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
         benchmark_xirr = get_benchmark_return(statement_start_date)
@@ -205,7 +209,7 @@ async def parse_statement(
         return {
             "status": "success",
             "summary": {
-                "capital_invested": round(total_cost, 2),
+                "capital_invested": round(total_period_corpus, 2),
                 "current_value": round(current_value, 2),
                 "opening_balance": round(opening_cost_total, 2),
                 "absolute_profit": round(absolute_profit, 2),
