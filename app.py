@@ -154,11 +154,10 @@ async def parse_statement(
         all_cash_flows = []
         schemes_data = []
         
-        # Robust extraction of statement start date
         statement_start_date = "2025-04-01"
         period_info = data.get("statement_period")
         if isinstance(period_info, dict) and period_info.get("from"):
-            statement_start_date = str(period_info.get("from"))[:10]
+            statement_start_date = str(period_info.get("from")).strip()
 
         folios = data.get("folios", [])
         for folio in folios:
@@ -167,14 +166,15 @@ async def parse_statement(
                 valuation = scheme.get("valuation") or {}
                 
                 val_amount = float(valuation.get("value", 0.0) or 0.0)
-                opening_cost = float(valuation.get("opening", 0.0) or 0.0)
+                # Check both 'opening' and 'cost' keys for fallback reliability
+                opening_cost = float(valuation.get("opening", 0.0) or valuation.get("cost", 0.0) or 0.0)
                 
                 current_value += val_amount
                 opening_cost_total += opening_cost
 
                 if opening_cost > 0:
                     all_cash_flows.append({
-                        "date": statement_start_date,
+                        "date": statement_start_date[:10],
                         "amount": opening_cost,
                         "type": "OPENING_VALUATION"
                     })
@@ -183,7 +183,7 @@ async def parse_statement(
                     tx_date = str(tx.get("date", ""))[:10]
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
-                    if tx_date >= statement_start_date:
+                    if tx_date >= statement_start_date[:10]:
                         if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
                             amt = float(tx["amount"])
                             period_inflows += amt
@@ -198,7 +198,7 @@ async def parse_statement(
         absolute_return_pct = round((absolute_profit / total_period_corpus) * 100, 2) if total_period_corpus > 0 else 0.0
         
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
-        benchmark_xirr = get_benchmark_return(statement_start_date)
+        benchmark_xirr = get_benchmark_return(statement_start_date[:10])
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
         return {
