@@ -172,6 +172,7 @@ async def parse_statement(
                 total_cost += cost_amount
                 opening_cost_total += opening_cost
 
+                # Inject opening balance as day-1 cash flow for period XIRR
                 if opening_cost > 0:
                     all_cash_flows.append({
                         "date": statement_start_date,
@@ -192,7 +193,8 @@ async def parse_statement(
                                 "type": tx_type
                             })
 
-        # Correct absolute profit calculation (Current Value minus Total Cost)
+        # Period-specific profit calculations matching your breakdown
+        net_inflows = opening_cost_total + sum(cf["amount"] for cf in all_cash_flows if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"])
         absolute_profit = current_value - total_cost
         absolute_return_pct = round((absolute_profit / total_cost) * 100, 2) if total_cost > 0 else 0.0
         
