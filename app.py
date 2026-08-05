@@ -8,8 +8,11 @@ import os
 import yfinance as yf
 import json
 import requests
+import difflib
+import re
+import threading
 
-app = FastAPI(title="FundWise Precision Statement Engine")
+app = FastAPI(title="FundWise Custom Statement Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,19 +21,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. Load ISIN Mapping Offline on Startup
-ISIN_TO_CODE_MAP = {}
-if os.path.exists("isin_map.json"):
-    try:
-        with open("isin_map.json", "r") as f:
-            ISIN_TO_CODE_MAP = json.load(f)
-    except Exception as e:
-        print(f"Warning: Could not load isin_map.json: {e}")
-
-# 2. In-Memory Cache for NAV History
+# ---------------------------------------------------------
+# GLOBAL CACHES & THREAD LOCKS
+# ---------------------------------------------------------
+SCHEME_CACHE_FILE = "scheme_cache.json"
+SCHEME_NAME_TO_CODE = {}
+AMFI_MASTER_LIST = []
+AMFI_LOCK = threading.Lock()
 NAV_CACHE = {}
 
-# 3. Strict Transaction Categorization Mapping
+# Load persistent scheme cache on startup
+if os.path.exists(SCHEME_CACHE_FILE):
+    try:
+        with open(SCHEME_CACHE_FILE, "r") as f:
+            SCHEME_NAME_TO_CODE = json.load(f)
+    except Exception:
+        pass
+
+def save_scheme_cache():
+    try:
+        with open(SCHEME_CACHE_FILE, "w") as f:
+            json.dump(SCHEME_NAME_TO_CODE, f, indent=4)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------
+# TRANSACTION MAPPING & DATE PARSING
+# ---------------------------------------------------------
 TXN_MAP = {
     "PURCHASE": 1,
     "ADDITIONAL PURCHASE": 1,
@@ -61,7 +78,6 @@ TXN_MAP = {
 }
 
 def normalize_txn_type(txn_type: str) -> int:
-    """Normalizes the transaction string and returns 1 (Inflow), -1 (Outflow), or 0 (Neutral)."""
     clean_type = str(txn_type).replace("_", " ").replace("-", " ").strip().upper()
     for key, val in TXN_MAP.items():
         if key in clean_type:
@@ -86,13 +102,74 @@ def parse_flexible_date(date_str: str) -> str:
             continue
     return "2025-04-01"
 
-def fetch_historical_nav(amfi_code: str, isin: str, date_str: str) -> float:
-    """Fetches historical NAV safely using pre-loaded JSON mapping and caching."""
-    scheme_code = str(amfi_code).strip() if amfi_code else None
-    
-    if not scheme_code or scheme_code.lower() == "none":
-        scheme_code = ISIN_TO_CODE_MAP.get(isin)
-        
+# ---------------------------------------------------------
+# DYNAMIC AMFI FUZZY MATCHING
+# ---------------------------------------------------------
+def get_amfi_master():
+    global AMFI_MASTER_LIST
+    with AMFI_LOCK:
+        if AMFI_MASTER_LIST:
+            return AMFI_MASTER_LIST
+        try:
+            resp = requests.get("https://www.amfiindia.com/spages/NAVAll.txt", timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.split('\n'):
+                    parts = line.split(';')
+                    if len(parts) >= 6 and parts[0].strip().isdigit():
+                        AMFI_MASTER_LIST.append({
+                            "code": parts[0].strip(),
+                            "name": parts[3].strip()
+                        })
+        except Exception:
+            pass
+        return AMFI_MASTER_LIST
+
+def clean_scheme_string(text: str) -> str:
+    text = str(text).lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    stopwords = {'direct', 'regular', 'plan', 'growth', 'option', 'idcw', 'non', 'demat', 'mutual', 'fund', 'advisor', 'dp', 'gr'}
+    words = [w for w in text.split() if w not in stopwords]
+    return " ".join(words)
+
+def find_scheme_code(cas_scheme_name: str, amfi_hint: str = "") -> str:
+    if cas_scheme_name in SCHEME_NAME_TO_CODE:
+        return SCHEME_NAME_TO_CODE[cas_scheme_name]
+
+    if amfi_hint and amfi_hint.isdigit():
+        SCHEME_NAME_TO_CODE[cas_scheme_name] = amfi_hint
+        save_scheme_cache()
+        return amfi_hint
+
+    master = get_amfi_master()
+    if not master:
+        return None
+
+    clean_cas = clean_scheme_string(cas_scheme_name)
+    best_code = None
+    best_ratio = 0.0
+
+    for item in master:
+        clean_amfi = clean_scheme_string(item["name"])
+        if clean_cas == clean_amfi:
+            best_code = item["code"]
+            break
+            
+        ratio = difflib.SequenceMatcher(None, clean_cas, clean_amfi).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_code = item["code"]
+            if ratio > 0.95:
+                break
+
+    if best_code:
+        SCHEME_NAME_TO_CODE[cas_scheme_name] = best_code
+        save_scheme_cache()
+        return best_code
+
+    return None
+
+def fetch_historical_nav(scheme_name: str, date_str: str, amfi_hint: str = "") -> float:
+    scheme_code = find_scheme_code(scheme_name, amfi_hint)
     if not scheme_code:
         return None
         
@@ -109,9 +186,6 @@ def fetch_historical_nav(amfi_code: str, isin: str, date_str: str) -> float:
                 }
             else:
                 NAV_CACHE[scheme_code] = {}
-        except requests.exceptions.RequestException:
-            # Immediate return on timeout to prevent hanging the API
-            return None
         except Exception:
             return None
             
@@ -119,19 +193,16 @@ def fetch_historical_nav(amfi_code: str, isin: str, date_str: str) -> float:
     
     # 7-Day Lookback for weekends and holidays
     for i in range(8):
-        check_dt = target_dt - timedelta(days=i)
-        check_str = check_dt.strftime("%Y-%m-%d")
+        check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
         if check_str in scheme_navs:
             return scheme_navs[check_str]
             
     return None
 
+# ---------------------------------------------------------
+# MATHEMATICAL SOLVER (-99% to +200%)
+# ---------------------------------------------------------
 def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> float:
-    """
-    Mathematically solves for the annualized rate 'r' such that:
-    Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
-    Bounded tightly between -99% and +200%.
-    """
     if not cf_data or closing_market_value <= 0:
         return 0.0
 
@@ -146,6 +217,7 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> f
                 deriv += item["amount"] * t * ((1.0 + r) ** (t - 1.0))
         return deriv
 
+    # 1. Newton-Raphson Optimization
     try:
         rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=500)
         if not isinstance(rate, complex) and -0.99 <= rate <= 2.0:
@@ -153,12 +225,14 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> f
     except Exception:
         pass
 
+    # 2. Brent's Method Fallback
     try:
         rate = brentq(return_func, -0.99, 2.0, maxiter=500)
         return round(float(rate) * 100, 2)
     except Exception:
         pass
 
+    # 3. Binary Search Fallback
     low, high = -0.99, 2.0
     mid = 0.0
     for _ in range(100):
@@ -197,6 +271,9 @@ def get_benchmark_return(start_date_str: str, end_date_str: str) -> float:
     except Exception:
         return 14.2
 
+# ---------------------------------------------------------
+# API ENDPOINT
+# ---------------------------------------------------------
 @app.post("/api/v1/parse-cas")
 async def parse_statement(
     file: UploadFile = File(...),
@@ -257,12 +334,11 @@ async def parse_statement(
                         
                 if opening_value is None and open_units > 0:
                     amfi_code = scheme.get("amfi", "")
-                    isin_code = scheme.get("isin", "")
-                    fetched_nav = fetch_historical_nav(amfi_code, isin_code, statement_start_str)
+                    fetched_nav = fetch_historical_nav(scheme_name, statement_start_str, amfi_code)
                     if fetched_nav:
                         opening_value = open_units * fetched_nav
                         
-                # Hard Fail: Do not proceed if opening market value is missing
+                # Hard Fail on Missing NAV to protect math integrity
                 if opening_value is None and open_units > 0:
                     raise ValueError(f"Opening Market Value could not be determined accurately for {scheme_name}. NAV on {statement_start_str} is required.")
                 
