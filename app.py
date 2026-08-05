@@ -18,28 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def parse_flexible_date(date_str: str) -> str:
-    if not date_str:
-        return "2025-04-01"
-    cleaned = str(date_str).strip()
-    
-    # Try multiple common formats including CAMS text formats
-    formats = ["%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y", "%b %d, %Y"]
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(cleaned[:11], fmt)
-            return dt.strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-            
-    # Fallback default matching statement period
-    return "2025-04-01"
-
 def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date: datetime) -> float:
     if not cash_flows:
         return 0.0
 
-    dates = [datetime.strptime(parse_flexible_date(cf["date"]), "%Y-%m-%d") for cf in cash_flows]
+    dates = [datetime.strptime(str(cf["date"])[:10], "%Y-%m-%d") for cf in cash_flows]
     amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "OPENING_VALUATION"] else abs(cf["amount"]) for cf in cash_flows]
 
     dates.append(end_date)
@@ -62,7 +45,7 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
 
 def get_benchmark_return(start_date_str: str) -> float:
     try:
-        clean_date = parse_flexible_date(start_date_str)
+        clean_date = str(start_date_str)[:10]
         start_date = datetime.strptime(clean_date, "%Y-%m-%d")
         ticker = yf.Ticker("^NSEI")
         df = ticker.history(start=clean_date)
@@ -90,7 +73,7 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
         buy_queue = [] 
         transactions = sorted(
             scheme.get("transactions", []), 
-            key=lambda x: datetime.strptime(parse_flexible_date(x["date"]), "%Y-%m-%d")
+            key=lambda x: datetime.strptime(str(x["date"])[:10], "%Y-%m-%d")
         )
         
         for tx in transactions:
@@ -101,7 +84,7 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
             if units is None or nav is None:
                 continue
                 
-            date_obj = datetime.strptime(parse_flexible_date(tx["date"]), "%Y-%m-%d")
+            date_obj = datetime.strptime(str(tx["date"])[:10], "%Y-%m-%d")
                 
             if t_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"]:
                 buy_queue.append({'date': date_obj, 'units': float(units), 'nav': float(nav)})
@@ -169,12 +152,13 @@ async def parse_statement(
         period_inflows = 0.0
         period_outflows = 0.0
         all_cash_flows = []
+        fresh_cash_flows = [] # Stream strictly for new investments during the period
         schemes_data = []
         
         statement_start_date = "2025-04-01"
         period_info = data.get("statement_period")
         if isinstance(period_info, dict) and period_info.get("from"):
-            statement_start_date = parse_flexible_date(period_info.get("from"))
+            statement_start_date = str(period_info.get("from"))[:10]
 
         folios = data.get("folios", [])
         for folio in folios:
@@ -196,8 +180,7 @@ async def parse_statement(
                     })
 
                 for tx in scheme.get("transactions", []):
-                    tx_date_raw = str(tx.get("date", ""))
-                    tx_date = parse_flexible_date(tx_date_raw)
+                    tx_date = str(tx.get("date", ""))[:10]
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
                     if tx_date >= statement_start_date:
@@ -205,6 +188,7 @@ async def parse_statement(
                             amt = float(tx["amount"])
                             period_inflows += amt
                             all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
+                            fresh_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
                         elif tx.get("amount") and tx_type in ["REDEMPTION", "SWITCH_OUT"]:
                             amt = float(tx["amount"])
                             period_outflows += abs(amt)
@@ -214,7 +198,10 @@ async def parse_statement(
         absolute_profit = current_value - (total_period_corpus - period_outflows)
         absolute_return_pct = round((absolute_profit / total_period_corpus) * 100, 2) if total_period_corpus > 0 else 0.0
         
+        # Calculate overall portfolio XIRR and Fresh Investments XIRR separately
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
+        fresh_xirr = calculate_xirr(fresh_cash_flows, period_inflows + (absolute_profit if period_inflows > 0 else 0), datetime.now()) if fresh_cash_flows else 0.0
+        
         benchmark_xirr = get_benchmark_return(statement_start_date)
         tax_data = process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit)
 
@@ -228,6 +215,7 @@ async def parse_statement(
                 "absolute_profit": round(absolute_profit, 2),
                 "absolute_return_pct": absolute_return_pct,
                 "xirr": xirr,
+                "fresh_xirr": fresh_xirr, # Added fresh investments XIRR metric
                 "benchmark_xirr": benchmark_xirr,
                 "total_transactions": len(all_cash_flows)
             },
