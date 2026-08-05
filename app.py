@@ -18,7 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global Cache for Historical NAV lookups
+# Global Caches for Performance
+ISIN_TO_CODE_CACHE = {}
 NAV_CACHE = {}
 
 # Strict Transaction Categorization Mapping
@@ -77,40 +78,74 @@ def parse_flexible_date(date_str: str) -> str:
             continue
     return "2025-04-01"
 
-def fetch_historical_nav(isin: str, scheme_name: str, date_str: str) -> float:
-    """Fetches historical NAV from mfapi.in using ISIN or Scheme Name, with local caching."""
-    if not isin and not scheme_name:
-        return None
-        
-    cache_key = f"{isin}_{date_str}"
-    if cache_key in NAV_CACHE:
-        return NAV_CACHE[cache_key]
-
+def ensure_isin_mapping():
+    """Fetches official AMFI master list to map ISINs to Scheme Codes securely."""
+    if ISIN_TO_CODE_CACHE:
+        return
     try:
-        search_query = isin if isin else scheme_name
-        search_resp = requests.get(f"https://api.mfapi.in/mf/search?q={search_query}", timeout=5)
-        if search_resp.status_code == 200:
-            data = search_resp.json()
-            if data and len(data) > 0:
-                scheme_code = data[0]['schemeCode']
-                nav_resp = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=5)
-                if nav_resp.status_code == 200:
-                    nav_data = nav_resp.json().get('data', [])
-                    target_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%m-%Y")
-                    for entry in nav_data:
-                        if entry['date'] == target_date:
-                            nav_val = float(entry['nav'])
-                            NAV_CACHE[cache_key] = nav_val
-                            return nav_val
+        resp = requests.get("https://www.amfiindia.com/spages/NAVAll.txt", timeout=10)
+        if resp.status_code == 200:
+            for line in resp.text.split('\n'):
+                parts = line.split(';')
+                if len(parts) >= 6 and parts[0].strip().isdigit():
+                    scheme_code = parts[0].strip()
+                    isin_growth = parts[1].strip()
+                    isin_reinv = parts[2].strip()
+                    if isin_growth and isin_growth != "-":
+                        ISIN_TO_CODE_CACHE[isin_growth] = scheme_code
+                    if isin_reinv and isin_reinv != "-":
+                        ISIN_TO_CODE_CACHE[isin_reinv] = scheme_code
     except Exception:
         pass
+
+def fetch_historical_nav(amfi_code: str, isin: str, date_str: str) -> float:
+    """
+    Fetches historical NAV by Scheme Code with a 7-day lookback for holidays/weekends.
+    Prioritizes casparser's amfi_code, falls back to ISIN mapping.
+    """
+    scheme_code = str(amfi_code).strip() if amfi_code else None
+    
+    if not scheme_code or scheme_code.lower() == "none":
+        ensure_isin_mapping()
+        scheme_code = ISIN_TO_CODE_CACHE.get(isin)
+        
+    if not scheme_code:
+        return None
+        
+    target_dt = datetime.strptime(date_str, "%Y-%m-%d")
+    
+    # Fetch and cache entire NAV history for the scheme to prevent repeated API calls
+    if scheme_code not in NAV_CACHE:
+        try:
+            resp = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json().get('data', [])
+                # Map standardized "YYYY-MM-DD" -> float NAV
+                NAV_CACHE[scheme_code] = {
+                    datetime.strptime(entry['date'], "%d-%m-%Y").strftime("%Y-%m-%d"): float(entry['nav'])
+                    for entry in data
+                }
+            else:
+                NAV_CACHE[scheme_code] = {}
+        except Exception:
+            return None
+            
+    scheme_navs = NAV_CACHE.get(scheme_code, {})
+    
+    # 7-Day Lookback for weekends and market holidays
+    for i in range(8):
+        check_dt = target_dt - timedelta(days=i)
+        check_str = check_dt.strftime("%Y-%m-%d")
+        if check_str in scheme_navs:
+            return scheme_navs[check_str]
+            
     return None
 
 def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> float:
     """
     Mathematically solves for the annualized rate 'r' such that:
     Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
-    Bounded between -99% and +200%.
+    Bounded tightly between -99% and +200%.
     """
     if not cf_data or closing_market_value <= 0:
         return 0.0
@@ -157,6 +192,7 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> f
     return round(mid * 100, 2)
 
 def get_benchmark_return(start_date_str: str, end_date_str: str) -> float:
+    """Strictly calculates the benchmark return from Statement Start Date to Statement End Date."""
     try:
         start_date = datetime.strptime(parse_flexible_date(start_date_str), "%Y-%m-%d")
         end_date = datetime.strptime(parse_flexible_date(end_date_str), "%Y-%m-%d")
@@ -228,26 +264,28 @@ async def parse_statement(
                 valuation = scheme.get("valuation") or {}
                 closing_value = float(valuation.get("value", 0.0) or 0.0)
                 
-                # Rule 1: Accurately Determine True Opening Market Value
+                # Accurately Determine True Opening Market Value
                 opening_value = None
                 open_units = float(scheme.get("open", 0.0))
                 
-                # Priority A: casparser explicit opening_value
+                # Priority 1: casparser explicit opening_value
                 if "opening_value" in scheme and scheme["opening_value"] is not None:
                     opening_value = float(scheme["opening_value"])
                 
-                # Priority B: Calculate from internal open_nav
+                # Priority 2: Calculate from internal open_nav
                 if opening_value is None and open_units > 0:
                     if "open_nav" in scheme and scheme["open_nav"]:
                         opening_value = open_units * float(scheme["open_nav"])
                         
-                # Priority C: Fetch Historical NAV via API
+                # Priority 3: Fetch Historical NAV via API (ISIN / AMFI mapping with lookback)
                 if opening_value is None and open_units > 0:
-                    fetched_nav = fetch_historical_nav(scheme.get("isin", ""), scheme_name, statement_start_str)
+                    amfi_code = scheme.get("amfi", "")
+                    isin_code = scheme.get("isin", "")
+                    fetched_nav = fetch_historical_nav(amfi_code, isin_code, statement_start_str)
                     if fetched_nav:
                         opening_value = open_units * fetched_nav
                         
-                # Hard Error if Opening Market Value cannot be determined
+                # Validation Hard Fail: Do not proceed if opening market value is missing
                 if opening_value is None and open_units > 0:
                     raise ValueError(f"Opening Market Value could not be determined accurately for {scheme_name}. NAV on {statement_start_str} is required.")
                 
@@ -261,14 +299,13 @@ async def parse_statement(
                 for tx in scheme.get("transactions", []):
                     tx_date_str = parse_flexible_date(str(tx.get("date", "")))
                     
-                    # Process strictly within statement period
                     if statement_start_str <= tx_date_str <= statement_end_str:
                         amt_val = tx.get("amount")
                         if amt_val is not None:
                             amt_abs = abs(float(amt_val))
                             tx_dir = normalize_txn_type(tx.get("type", ""))
                             
-                            # Rule 5 & 6: Explicit signed cash flows based on mapping
+                            # Explicit signed cash flows based on rigorous mapping
                             if tx_dir == 1:
                                 fund_investments += amt_abs
                                 tx_list.append({"date": tx_date_str, "amount": amt_abs}) # Positive
@@ -277,7 +314,7 @@ async def parse_statement(
                                 tx_list.append({"date": tx_date_str, "amount": -amt_abs}) # Negative
                             
                 fund_cash_flows = []
-                # Rule 4: Opening value treated as investment on statement start date
+                # Opening value injected as positive investment on statement start date
                 if opening_value > 0:
                     fund_cash_flows.append({
                         "date": statement_start_str,
@@ -285,12 +322,12 @@ async def parse_statement(
                     })
                 fund_cash_flows.extend(tx_list)
 
-                # Rule 11: Standardized Capital Deployed and Profit math
+                # Standardized Capital Deployed and Absolute Profit
                 capital_deployed = opening_value + fund_investments - fund_redemptions
                 absolute_profit = closing_value - capital_deployed
                 absolute_return_pct = round((absolute_profit / capital_deployed) * 100, 2) if capital_deployed > 0 else 0.0
                 
-                # Rule 3: Solve statement annualized return
+                # Fund-wise statement annualized return
                 cf_data = []
                 for cf in fund_cash_flows:
                     cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
@@ -308,19 +345,19 @@ async def parse_statement(
                     "statement_annualized_return": statement_annualized_return
                 })
 
-                # Rule 6: Aggregate every cash flow to portfolio list without altering signs
+                # Aggregate every portfolio cash flow into master list without altering signs
                 portfolio_opening_value += opening_value
                 portfolio_total_investments += fund_investments
                 portfolio_total_redemptions += fund_redemptions
                 portfolio_current_value += closing_value
                 portfolio_cash_flows.extend(fund_cash_flows)
 
-        # Portfolio Aggregation Math
+        # Portfolio Aggregation
         total_capital_deployed = portfolio_opening_value + portfolio_total_investments - portfolio_total_redemptions
         total_profit = portfolio_current_value - total_capital_deployed
         portfolio_abs_return_pct = round((total_profit / total_capital_deployed) * 100, 2) if total_capital_deployed > 0 else 0.0
         
-        # Rule 6: Solve single rate for total aggregated portfolio
+        # Single rooted rate for total aggregated portfolio
         port_cf_data = []
         for cf in portfolio_cash_flows:
             cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
