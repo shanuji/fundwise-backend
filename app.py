@@ -329,7 +329,7 @@ async def parse_statement(
                     opening_value, resolution_path = float(scheme["opening_value"]), "CAS Explicit Opening Value"
                 if opening_value is None and scheme.get("open_nav"):
                     opening_value, resolution_path = open_units * float(scheme["open_nav"]), f'CAS Explicit Opening NAV'
-                                if opening_value is None and scheme.get("amfi"):
+                if opening_value is None and scheme.get("amfi"):
                     amfi_code = str(scheme.get("amfi")).strip()
                     fetched_nav = fetch_historical_nav_by_amfi(amfi_code, statement_start_str)
                     if fetched_nav:
