@@ -155,11 +155,11 @@ async def parse_statement(
         schemes_data = []
         statement_start_date = "2025-04-01"
 
-        folios = data.get("folios", [])
         period_info = data.get("statement_period", {})
         if period_info and period_info.get("from"):
             statement_start_date = str(period_info.get("from"))[:10]
 
+        folios = data.get("folios", [])
         for folio in folios:
             for scheme in folio.get("schemes", []):
                 schemes_data.append(scheme)
@@ -192,14 +192,8 @@ async def parse_statement(
                             period_outflows += abs(amt)
                             all_cash_flows.append({"date": tx_date, "amount": amt, "type": tx_type})
 
-        # STRICT STATEMENT PERIOD FORMULA:
-        # Total Active Corpus Base for the period = Opening Balance + Period Inflows
         total_period_corpus = opening_cost_total + period_inflows
-        
-        # Period Profit = Current Value minus (Opening Balance + Net Inflows)
         absolute_profit = current_value - (total_period_corpus - period_outflows)
-        
-        # Absolute Return Percentage strictly for the period
         absolute_return_pct = round((absolute_profit / total_period_corpus) * 100, 2) if total_period_corpus > 0 else 0.0
         
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
@@ -212,6 +206,7 @@ async def parse_statement(
                 "capital_invested": round(total_period_corpus, 2),
                 "current_value": round(current_value, 2),
                 "opening_balance": round(opening_cost_total, 2),
+                "statement_start_date": statement_start_date, // Passed dynamically to frontend
                 "absolute_profit": round(absolute_profit, 2),
                 "absolute_return_pct": absolute_return_pct,
                 "xirr": xirr,
