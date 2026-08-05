@@ -153,10 +153,11 @@ async def parse_statement(
         period_outflows = 0.0
         all_cash_flows = []
         schemes_data = []
+        
+        # Robust extraction of statement start date
         statement_start_date = "2025-04-01"
-
-        period_info = data.get("statement_period", {})
-        if period_info and period_info.get("from"):
+        period_info = data.get("statement_period")
+        if isinstance(period_info, dict) and period_info.get("from"):
             statement_start_date = str(period_info.get("from"))[:10]
 
         folios = data.get("folios", [])
@@ -203,10 +204,10 @@ async def parse_statement(
         return {
             "status": "success",
             "summary": {
-                "capital_invested": round(total_period_corpus, 2),
+                "capital_invested": round(period_inflows, 2),
                 "current_value": round(current_value, 2),
                 "opening_balance": round(opening_cost_total, 2),
-                "statement_start_date": statement_start_date, // Passed dynamically to frontend
+                "statement_start_date": statement_start_date,
                 "absolute_profit": round(absolute_profit, 2),
                 "absolute_return_pct": absolute_return_pct,
                 "xirr": xirr,
