@@ -150,14 +150,11 @@ async def parse_statement(
         current_value = 0.0
         total_cost = 0.0
         opening_cost_total = 0.0
-        opening_market_total = 0.0
         all_cash_flows = []
         schemes_data = []
-        statement_start_date = "2025-04-01" # Default fallback matching statement period[span_2](start_span)[span_2](end_span)
+        statement_start_date = "2025-04-01"
 
         folios = data.get("folios", [])
-        
-        # Extract statement period start date dynamically if present in header
         period_info = data.get("statement_period", {})
         if period_info and period_info.get("from"):
             statement_start_date = str(period_info.get("from"))[:10]
@@ -175,9 +172,7 @@ async def parse_statement(
                 total_cost += cost_amount
                 opening_cost_total += opening_cost
 
-                # If there's an opening balance value, treat it as a portfolio injection on day 1 of the statement
                 if opening_cost > 0:
-                    opening_market_total += opening_cost # Approximation for opening valuation if market split isn't indexed
                     all_cash_flows.append({
                         "date": statement_start_date,
                         "amount": opening_cost,
@@ -188,7 +183,6 @@ async def parse_statement(
                     tx_date = str(tx.get("date", ""))[:10]
                     tx_type = str(tx.get("type", "")).split('.')[-1].upper()
                     
-                    # Only include transactions that occurred ON or AFTER the statement start date
                     if tx_date >= statement_start_date:
                         if tx.get("amount") and tx_type in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "REDEMPTION", "SWITCH_OUT"]:
                             amt = float(tx["amount"])
@@ -198,12 +192,9 @@ async def parse_statement(
                                 "type": tx_type
                             })
 
-        # Period-specific profit and return calculation
-        period_inflows = sum(cf["amount"] for cf in all_cash_flows if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST", "OPENING_VALUATION"])
-        period_outflows = sum(abs(cf["amount"]) for cf in all_cash_flows if cf["type"] in ["REDEMPTION", "SWITCH_OUT"])
-        
-        period_net_gain = current_value - (period_inflows - period_outflows)
-        period_return_pct = round((period_net_gain / period_inflows) * 100, 2) if period_inflows > 0 else 0.0
+        # Correct absolute profit calculation (Current Value minus Total Cost)
+        absolute_profit = current_value - total_cost
+        absolute_return_pct = round((absolute_profit / total_cost) * 100, 2) if total_cost > 0 else 0.0
         
         xirr = calculate_xirr(all_cash_flows, current_value, datetime.now())
         benchmark_xirr = get_benchmark_return(statement_start_date)
@@ -215,8 +206,8 @@ async def parse_statement(
                 "capital_invested": round(total_cost, 2),
                 "current_value": round(current_value, 2),
                 "opening_balance": round(opening_cost_total, 2),
-                "absolute_profit": round(period_net_gain, 2),
-                "absolute_return_pct": period_return_pct,
+                "absolute_profit": round(absolute_profit, 2),
+                "absolute_return_pct": absolute_return_pct,
                 "xirr": xirr,
                 "benchmark_xirr": benchmark_xirr,
                 "total_transactions": len(all_cash_flows)
