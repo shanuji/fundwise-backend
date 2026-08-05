@@ -217,12 +217,12 @@ def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
     if cache_key in BENCHMARK_PRICE_CACHE:
         return BENCHMARK_PRICE_CACHE[cache_key]
 
-    # Using NIFTYBEES.NS (ETF) to properly account for Total Return (Dividends)
-    ticker = yf.Ticker("NIFTYBEES.NS")
+    # Reverted to ^NSEI (Nifty 50 Price Return Index) for mathematical precision
+    ticker = yf.Ticker("^NSEI")
     df = ticker.history(start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
     
     if df.empty or len(df) == 0:
-        raise ValueError(f"Yahoo Finance returned 0 prices for NIFTYBEES.NS between {start_dt.date()} and {end_dt.date()}.")
+        raise ValueError(f"Yahoo Finance returned 0 prices for ^NSEI between {start_dt.date()} and {end_dt.date()}.")
         
     price_dict = {}
     for index, row in df.iterrows():
@@ -235,13 +235,13 @@ def fetch_benchmark_prices(start_date_str: str, end_date_str: str) -> dict:
 def get_closest_benchmark_price(date_str: str, price_dict: dict) -> float:
     target_dt = datetime.strptime(date_str, "%Y-%m-%d")
     
-    # 1. Walk FORWARD to simulate Next-Business-Day execution (Standard MF behavior)
+    # 1. Walk FORWARD to simulate Next-Business-Day execution
     for i in range(5):
         check_str = (target_dt + timedelta(days=i)).strftime("%Y-%m-%d")
         if check_str in price_dict:
             return price_dict[check_str]
             
-    # 2. Walk BACKWARD only as a fallback (e.g., if target is today and markets haven't closed)
+    # 2. Walk BACKWARD only as a fallback
     for i in range(1, 10):
         check_str = (target_dt - timedelta(days=i)).strftime("%Y-%m-%d")
         if check_str in price_dict:
@@ -269,7 +269,6 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float, cont
                 deriv += item["amount"] * t * ((1.0 + r) ** (t - 1.0))
         return deriv
 
-    # 1. Newton
     try:
         rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=500)
         if not isinstance(rate, complex) and -0.99 <= rate <= 2.0:
@@ -277,14 +276,12 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float, cont
     except Exception as e:
         print(f"[{context}] Newton solver failed to converge: {e}")
 
-    # 2. Brent
     try:
         rate = brentq(return_func, -0.99, 2.0, maxiter=500)
         return round(float(rate) * 100, 2)
     except Exception as e:
         print(f"[{context}] Brentq solver failed to converge: {e}")
 
-    # 3. Binary Search
     low, high = -0.99, 2.0
     mid = 0.0
     val = 0.0
@@ -298,7 +295,7 @@ def solve_annualized_rate(cf_data: list[dict], closing_market_value: float, cont
         else:
             low = mid
             
-    if abs(val) > 1.0: # If the mathematical residual is off by more than 1 Rupee
+    if abs(val) > 1.0: 
         error_msg = f"[{context}] Binary search failed to converge. Final residual gap: {val}, Rate bounded between {low} and {high}."
         print(error_msg)
         raise ValueError(error_msg)
@@ -440,7 +437,12 @@ async def parse_statement(
                     cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
                     holding_days = max(0, (statement_end_dt - cf_date).days)
                     cf_data.append({"amount": cf["amount"], "days": holding_days})
-                statement_annualized_return = solve_annualized_rate(cf_data, closing_value, context=f"Fund: {scheme_name}")
+                
+                # BUGFIX: Prevent solver crash on inactive funds
+                if not cf_data:
+                    statement_annualized_return = None
+                else:
+                    statement_annualized_return = solve_annualized_rate(cf_data, closing_value, context=f"Fund: {scheme_name}")
 
                 funds_breakdown.append({
                     "scheme_name": scheme_name,
@@ -469,7 +471,11 @@ async def parse_statement(
             holding_days = max(0, (statement_end_dt - cf_date).days)
             port_cf_data.append({"amount": cf["amount"], "days": holding_days})
             
-        portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
+        # BUGFIX: Safeguard portfolio solver
+        if not port_cf_data:
+            portfolio_annualized_return = None
+        else:
+            portfolio_annualized_return = solve_annualized_rate(port_cf_data, portfolio_current_value, context="Total Portfolio")
         
         # ---------------------------------------------------------
         # TRUE MONEY-WEIGHTED BENCHMARK SIMULATION
@@ -492,7 +498,6 @@ async def parse_statement(
             units_transacted = cf_amount / nav
             realized_cf_amount = cf_amount
             
-            # Prevent Negative Benchmark Bankruptcy
             if units_transacted < 0 and abs(units_transacted) > benchmark_units:
                 units_transacted = -benchmark_units 
                 realized_cf_amount = units_transacted * nav 
@@ -515,8 +520,12 @@ async def parse_statement(
         print(f"Final Benchmark NAV: {final_benchmark_nav}")
         print(f"Benchmark Simulated Closing Value: {benchmark_simulated_closing_value}")
 
-        benchmark_annualized = solve_annualized_rate(benchmark_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
-        print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
+        # BUGFIX: Safeguard benchmark solver
+        if not benchmark_cf_data:
+            benchmark_annualized = None
+        else:
+            benchmark_annualized = solve_annualized_rate(benchmark_cf_data, benchmark_simulated_closing_value, context="Nifty 50 Benchmark")
+            print(f"Benchmark Annualized Return Successfully Solved: {benchmark_annualized}%\n")
 
         return {
             "status": "success",
