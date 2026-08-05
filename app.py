@@ -7,6 +7,7 @@ from datetime import datetime
 import tempfile
 import os
 import yfinance as yf
+import json  # ADDED: Crucial for foolproof extraction
 
 app = FastAPI(title="FundWise Precision Engine")
 
@@ -21,7 +22,6 @@ def calculate_xirr(cash_flows: list[dict], current_market_value: float, end_date
     if not cash_flows:
         return 0.0
 
-    # Safely convert incoming dates (whether they are strings or date objects) to strings for parsing
     dates = [datetime.strptime(str(cf["date"])[:10], "%Y-%m-%d") for cf in cash_flows]
     amounts = [-abs(cf["amount"]) if cf["type"] in ["PURCHASE", "SIP", "SWITCH_IN", "DIVIDEND_REINVEST"] else abs(cf["amount"]) for cf in cash_flows]
 
@@ -71,14 +71,12 @@ def process_capital_gains(schemes_data, ltcg_rate, stcg_rate, exemption_limit):
     
     for scheme in schemes_data:
         buy_queue = [] 
-        # Safely sort transactions by extracting the first 10 characters of the date string
         transactions = sorted(
             scheme.get("transactions", []), 
             key=lambda x: datetime.strptime(str(x["date"])[:10], "%Y-%m-%d")
         )
         
         for tx in transactions:
-            # Force the enum/type to be a clean string
             t_type = str(tx.get("type", "")).split('.')[-1].upper()
             units = tx.get("units")
             nav = tx.get("nav")
@@ -146,16 +144,10 @@ async def parse_statement(
         tmp_path = tmp.name
 
     try:
-        # 1. Parse the PDF using casparser
-        raw_data = casparser.read_cas_pdf(tmp_path, password=password)
-        
-        # 2. Safely convert the custom CASData object into a standard Python dictionary
-        if hasattr(raw_data, "model_dump"):
-            data = raw_data.model_dump()
-        elif hasattr(raw_data, "dict"):
-            data = raw_data.dict()
-        else:
-            data = vars(raw_data)
+        # THE FIX: Export straight to a JSON string, then load back to a pure dictionary. 
+        # This completely destroys the 'CASData' object conflict.
+        raw_json_str = casparser.read_cas_pdf(tmp_path, password=password, output="json")
+        data = json.loads(raw_json_str)
         
         total_invested = 0.0
         current_value = 0.0
