@@ -1,14 +1,14 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import casparser
-from scipy.optimize import newton
+from scipy.optimize import newton, brentq
 from datetime import datetime, timedelta
 import tempfile
 import os
 import yfinance as yf
 import json
 
-app = FastAPI(title="FundWise Custom Statement Engine")
+app = FastAPI(title="FundWise Precision Statement Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,27 +35,18 @@ def parse_flexible_date(date_str: str) -> str:
             continue
     return "2025-04-01"
 
-def calculate_statement_annualized_return(cash_flows: list[dict], closing_market_value: float, end_date: datetime) -> float:
+def solve_annualized_rate(cf_data: list[dict], closing_market_value: float) -> float:
     """
-    Mathematically solves for the annualized rate 'r' such that:
-    Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
+    Solves for 'r' where: Closing Value = Σ(Cash Flow × (1 + r)^(HoldingDays / 365))
+    Using Newton-Raphson -> Brentq -> Binary Search fallbacks.
     """
-    if not cash_flows or closing_market_value <= 0:
+    if not cf_data or closing_market_value <= 0:
         return 0.0
 
-    cf_data = []
-    for cf in cash_flows:
-        cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
-        holding_days = max(0, (end_date - cf_date).days)
-        cf_data.append({"amount": cf["amount"], "days": holding_days})
-
     def return_func(r):
-        # Calculate the compounded future value of all cash flows
-        compounded_sum = sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data)
-        return compounded_sum - closing_market_value
+        return sum(item["amount"] * ((1.0 + r) ** (item["days"] / 365.0)) for item in cf_data) - closing_market_value
 
     def return_derivative(r):
-        # Derivative with respect to r for Newton-Raphson optimization
         deriv = 0.0
         for item in cf_data:
             t = item["days"] / 365.0
@@ -63,22 +54,48 @@ def calculate_statement_annualized_return(cash_flows: list[dict], closing_market
                 deriv += item["amount"] * t * ((1.0 + r) ** (t - 1.0))
         return deriv
 
+    # 1. Newton-Raphson
     try:
-        # Solve for r using Newton's method
-        rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=500)
+        rate = newton(return_func, 0.10, fprime=return_derivative, maxiter=1000)
+        if not isinstance(rate, complex) and rate > -1.0:
+            return round(float(rate) * 100, 2)
+    except Exception:
+        pass
+
+    # 2. Brent's Method
+    try:
+        rate = brentq(return_func, -0.9999, 100.0, maxiter=1000)
         return round(float(rate) * 100, 2)
     except Exception:
-        return 0.0
+        pass
+
+    # 3. Binary Search (Bisection Fallback)
+    low, high = -0.9999, 100.0
+    for _ in range(100):
+        mid = (low + high) / 2.0
+        val = return_func(mid)
+        if abs(val) < 1e-5:
+            return round(mid * 100, 2)
+        if val > 0:
+            high = mid  # Future value is too high, lower the rate
+        else:
+            low = mid   # Future value is too low, raise the rate
+            
+    return round(mid * 100, 2)
+
+def calculate_statement_annualized_return(cash_flows: list[dict], closing_market_value: float, end_date: datetime) -> float:
+    cf_data = []
+    for cf in cash_flows:
+        cf_date = datetime.strptime(cf["date"], "%Y-%m-%d")
+        holding_days = max(0, (end_date - cf_date).days)
+        cf_data.append({"amount": cf["amount"], "days": holding_days})
+        
+    return solve_annualized_rate(cf_data, closing_market_value)
 
 def get_benchmark_return(start_date_str: str, end_date_str: str) -> float:
-    """
-    Strictly calculates the benchmark return from the Statement Start Date to the Statement End Date.
-    """
     try:
         start_date = datetime.strptime(parse_flexible_date(start_date_str), "%Y-%m-%d")
         end_date = datetime.strptime(parse_flexible_date(end_date_str), "%Y-%m-%d")
-        
-        # Add 1 day to end_date to ensure yfinance includes the final day's close
         end_fetch_date = end_date + timedelta(days=1)
         
         ticker = yf.Ticker("^NSEI")
@@ -141,9 +158,9 @@ async def parse_statement(
         funds_breakdown = []
         folios = data.get("folios", [])
         
-        # Classification arrays mapping exact transaction strings
-        inflows = ["PURCHASE", "SIP", "LUMPSUM", "SWITCH_IN", "STP_IN", "DIVIDEND_REINVEST"]
-        outflows = ["REDEMPTION", "SWITCH_OUT", "STP_OUT", "SWP", "DIVIDEND_PAYOUT"]
+        inflow_keywords = ["PURCHASE", "SIP", "LUMPSUM", "SWITCH IN", "STP IN", "DIVIDEND REINVEST"]
+        outflow_keywords = ["REDEMPTION", "SWITCH OUT", "STP OUT", "SWP", "DIVIDEND PAYOUT"]
+        neutral_keywords = ["SEGREGATION", "MERGER", "REVERSE MERGER", "BONUS", "STAMP"]
         
         for folio in folios:
             for scheme in folio.get("schemes", []):
@@ -151,13 +168,24 @@ async def parse_statement(
                 valuation = scheme.get("valuation") or {}
                 
                 closing_value = float(valuation.get("value", 0.0) or 0.0)
-                closing_total_cost = float(valuation.get("cost", 0.0) or 0.0)
+                
+                # Accurately isolate starting market value
+                opening_value = float(valuation.get("opening", valuation.get("opening_value", 0.0)))
+                if opening_value <= 0.0:
+                    opening_units = float(scheme.get("open", 0.0))
+                    if opening_units > 0:
+                        first_nav = None
+                        for tx in scheme.get("transactions", []):
+                            if tx.get("nav") is not None:
+                                first_nav = float(tx["nav"])
+                                break
+                        if first_nav:
+                            opening_value = opening_units * first_nav
                 
                 fund_investments = 0.0
                 fund_redemptions = 0.0
                 tx_list = []
                 
-                # Rule 5, 6, 9: Classify and trace all transactions strictly within period
                 for tx in scheme.get("transactions", []):
                     tx_date_str = parse_flexible_date(str(tx.get("date", "")))
                     
@@ -165,11 +193,15 @@ async def parse_statement(
                         amt_val = tx.get("amount")
                         if amt_val is not None:
                             amt = float(amt_val)
-                            tx_type = str(tx.get("type", "")).replace(" ", "_").upper()
+                            tx_type_upper = str(tx.get("type", "")).replace("_", " ").upper()
                             
-                            is_inflow = any(kw in tx_type for kw in inflows)
-                            is_outflow = any(kw in tx_type for kw in outflows)
+                            is_inflow = any(kw in tx_type_upper for kw in inflow_keywords)
+                            is_outflow = any(kw in tx_type_upper for kw in outflow_keywords)
+                            is_neutral = any(kw in tx_type_upper for kw in neutral_keywords)
                             
+                            if is_neutral or amt == 0:
+                                continue
+                                
                             if is_inflow:
                                 amt_abs = abs(amt)
                                 fund_investments += amt_abs
@@ -177,9 +209,8 @@ async def parse_statement(
                             elif is_outflow:
                                 amt_abs = abs(amt)
                                 fund_redemptions += amt_abs
-                                tx_list.append({"date": tx_date_str, "amount": -amt_abs}) # Negative Cash Flow
+                                tx_list.append({"date": tx_date_str, "amount": -amt_abs})
                             else:
-                                # Fallback numerical safety net for unmapped labels
                                 if amt > 0:
                                     fund_investments += amt
                                     tx_list.append({"date": tx_date_str, "amount": amt})
@@ -187,10 +218,6 @@ async def parse_statement(
                                     fund_redemptions += abs(amt)
                                     tx_list.append({"date": tx_date_str, "amount": amt})
 
-                # Rule 4: Opening market value derived and injected as positive cash flow on statement start date
-                opening_value = closing_total_cost - (fund_investments - fund_redemptions)
-                opening_value = max(0.0, opening_value) 
-                
                 fund_cash_flows = []
                 if opening_value > 0:
                     fund_cash_flows.append({
@@ -199,15 +226,10 @@ async def parse_statement(
                     })
                 fund_cash_flows.extend(tx_list)
 
-                # Rule 11: Absolute Return Math
                 capital_deployed = opening_value + fund_investments - fund_redemptions
                 absolute_profit = closing_value - capital_deployed
                 absolute_return_pct = round((absolute_profit / capital_deployed) * 100, 2) if capital_deployed > 0 else 0.0
-                
-                # Fund-wise Newton solve
-                statement_annualized_return = calculate_statement_annualized_return(
-                    fund_cash_flows, closing_value, statement_end_dt
-                )
+                statement_annualized_return = calculate_statement_annualized_return(fund_cash_flows, closing_value, statement_end_dt)
 
                 funds_breakdown.append({
                     "scheme_name": scheme_name,
@@ -219,7 +241,6 @@ async def parse_statement(
                     "statement_annualized_return": statement_annualized_return
                 })
 
-                # Rule 7: Aggregate every transaction into the master portfolio stream
                 portfolio_opening_value += opening_value
                 portfolio_total_investments += fund_investments
                 portfolio_total_redemptions += fund_redemptions
@@ -230,15 +251,9 @@ async def parse_statement(
         total_profit = portfolio_current_value - total_capital_deployed
         portfolio_abs_return_pct = round((total_profit / total_capital_deployed) * 100, 2) if total_capital_deployed > 0 else 0.0
         
-        # Rule 7: Single annualized calculation over the entire aggregated portfolio
-        portfolio_annualized_return = calculate_statement_annualized_return(
-            portfolio_cash_flows, portfolio_current_value, statement_end_dt
-        )
-        
-        # Rule 8: True statement period benchmark
+        portfolio_annualized_return = calculate_statement_annualized_return(portfolio_cash_flows, portfolio_current_value, statement_end_dt)
         benchmark_annualized = get_benchmark_return(statement_start_str, statement_end_str)
 
-        # Rule 10: Retain strict JSON
         return {
             "status": "success",
             "statement_period": {
