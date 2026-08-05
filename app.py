@@ -329,11 +329,12 @@ async def parse_statement(
                     opening_value, resolution_path = float(scheme["opening_value"]), "CAS Explicit Opening Value"
                 if opening_value is None and scheme.get("open_nav"):
                     opening_value, resolution_path = open_units * float(scheme["open_nav"]), f'CAS Explicit Opening NAV'
-                if opening_value is None:
-                    amfi_code = str(scheme.get("amfi", "")).strip()
-                    fetched_nav = fetch_historical_nav(scheme_name, statement_start_str, amfi_code)
+                                if opening_value is None and scheme.get("amfi"):
+                    amfi_code = str(scheme.get("amfi")).strip()
+                    fetched_nav = fetch_historical_nav_by_amfi(amfi_code, statement_start_str)
                     if fetched_nav:
-                        opening_value, resolution_path = open_units * fetched_nav, f"MFAPI Official AMFI Lookup"
+                        opening_value = open_units * fetched_nav
+                        resolution_path = f"MFAPI Official AMFI Lookup ({fetched_nav})"
                 if opening_value is None and first_tx_nav is not None:
                     opening_value, resolution_path = open_units * first_tx_nav, "Fallback 1: Earliest Transaction NAV"
                 if opening_value is None:
