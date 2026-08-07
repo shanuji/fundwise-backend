@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 import casparser
 from pyxirr import xirr
 import json
@@ -71,6 +72,17 @@ class CASResponse(BaseModel):
 # ==========================================
 # 2. ANALYTICS & MATH HELPERS
 # ==========================================
+def to_float(val, default=0.0) -> float:
+    """Safely converts Decimal, float, int, or numeric strings to standard Python float."""
+    if val is None:
+        return default
+    if isinstance(val, Decimal):
+        return float(val)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 def calculate_xirr(cashflows: list) -> Optional[float]:
     if len(cashflows) < 2:
         return None
@@ -119,7 +131,7 @@ def replay_nifty_tri_cashflows(cashflows: list, start_date: date, end_date: date
         if nav_date_str not in nifty_data:
             return None, None
             
-        nifty_price = nifty_data[nav_date_str]
+        nifty_price = to_float(nifty_data[nav_date_str])
         if amount < 0:
             units_bought = abs(amount) / nifty_price
             total_benchmark_units += units_bought
@@ -177,7 +189,7 @@ async def fetch_amfi_nav_async(client: httpx.AsyncClient, amfi_code: str, target
             date_str = search_date.strftime("%d-%m-%Y")
             for entry in nav_history:
                 if entry["date"] == date_str:
-                    val = float(entry["nav"])
+                    val = to_float(entry.get("nav"))
                     cache[cache_key] = val
                     return val
             search_date -= timedelta(days=1)
@@ -186,17 +198,17 @@ async def fetch_amfi_nav_async(client: httpx.AsyncClient, amfi_code: str, target
     return None
 
 async def resolve_opening_market_value(scheme: dict, stmt_from: date, scheme_name: str, client: httpx.AsyncClient, cache: dict) -> tuple[Optional[float], str]:
-    opening_units = scheme.get('open', 0.0)
+    opening_units = to_float(scheme.get('open', 0.0))
     if opening_units == 0.0:
         return 0.0, "Zero opening units"
         
     val = scheme.get('opening_value')
-    if val is not None and float(val) > 0:
-        return float(val), "Explicit opening_value from CAS"
+    if val is not None and to_float(val) > 0:
+        return to_float(val), "Explicit opening_value from CAS"
         
     nav = scheme.get('open_nav')
-    if nav is not None and float(nav) > 0:
-        return opening_units * float(nav), "Calculated via open_nav * units"
+    if nav is not None and to_float(nav) > 0:
+        return opening_units * to_float(nav), "Calculated via open_nav * units"
         
     amfi_code = scheme.get('amfi')
     if amfi_code:
@@ -206,8 +218,8 @@ async def resolve_opening_market_value(scheme: dict, stmt_from: date, scheme_nam
     
     for tx in scheme.get('transactions', []):
         tx_nav = tx.get('nav')
-        if tx_nav is not None and float(tx_nav) > 0:
-            return opening_units * float(tx_nav), "Resolved via earliest transaction NAV proxy"
+        if tx_nav is not None and to_float(tx_nav) > 0:
+            return opening_units * to_float(tx_nav), "Resolved via earliest transaction NAV proxy"
 
     return None, "Opening market value unavailable with mathematical certainty"
 
@@ -270,9 +282,9 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                 for scheme in folio.get('schemes', []):
                     total_funds_count += 1
                     scheme_name = scheme.get('scheme', 'Unknown Scheme')
-                    ending_market_value = scheme.get('valuation', {}).get('value', 0.0)
-                    units = scheme.get('valuation', {}).get('balance', 0.0)
-                    latest_nav = scheme.get('valuation', {}).get('nav', 0.0)
+                    ending_market_value = to_float(scheme.get('valuation', {}).get('value', 0.0))
+                    units = to_float(scheme.get('valuation', {}).get('balance', 0.0))
+                    latest_nav = to_float(scheme.get('valuation', {}).get('nav', 0.0))
                     
                     opening_market_value, resolution_path = await resolve_opening_market_value(scheme, stmt_from, scheme_name, client, amfi_request_cache)
                     
@@ -311,7 +323,7 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                         tx_type_raw = tx.get('type', '')
                         tx_type = normalize_txn_type(tx_desc, tx_type_raw)
                         
-                        tx_amt = abs(tx.get('amount', 0.0))
+                        tx_amt = abs(to_float(tx.get('amount', 0.0)))
                         tx['scheme_name'] = scheme_name
                         tx['normalized_type'] = tx_type
                         all_transactions.append(tx)
