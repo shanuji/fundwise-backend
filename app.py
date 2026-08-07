@@ -9,7 +9,7 @@ import json
 import os
 import httpx
 
-app = FastAPI(title="FundWise API")
+app = FastAPI(title="FundWise Analytics Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,20 +22,22 @@ app.add_middleware(
 DEBUG_LOGGING = os.getenv("FUNDWISE_DEBUG", "True").lower() in ("true", "1")
 
 # ==========================================
-# 1. STRICT RESPONSE MODELS
+# 1. RESPONSE MODELS
 # ==========================================
 class FundBreakdown(BaseModel):
     scheme_name: str
-    opening_value: Optional[float]
-    fund_investments: float
-    fund_redemptions: float
-    capital_deployed: Optional[float]
-    current_value: float
+    opening_market_value: Optional[float]
+    statement_investments: float
+    statement_redemptions: float
+    dividend_payouts: float
+    ending_market_value: float
     units: float
     latest_nav: float
-    absolute_profit: Optional[float]
-    absolute_return_pct: Optional[float]
+    net_wealth_gain: Optional[float]
+    statement_return_pct: Optional[float]
     statement_annualized_return: Optional[float]
+    nifty_statement_return_pct: Optional[float]
+    nifty_annualized_return: Optional[float]
     resolution_path: str
     is_fully_redeemed: bool
 
@@ -48,11 +50,15 @@ class DataQualityMetrics(BaseModel):
 class PortfolioSummary(BaseModel):
     statement_period: dict
     opening_portfolio_value: Optional[float]
-    total_capital_deployed: Optional[float]
-    current_portfolio_value: float
-    total_profit: Optional[float]
+    total_statement_investments: float
+    total_statement_redemptions: float
+    total_dividend_payouts: float
+    ending_portfolio_value: float
+    net_wealth_gain: Optional[float]
+    statement_return_pct: Optional[float]
     statement_annualized_return: Optional[float]
-    benchmark_annualized_return: Optional[float]
+    nifty_statement_return_pct: Optional[float]
+    nifty_annualized_return: Optional[float]
     benchmark_status: str
     data_quality: DataQualityMetrics
 
@@ -63,9 +69,10 @@ class CASResponse(BaseModel):
 
 
 # ==========================================
-# 2. ASYNC & CACHED HELPER FUNCTIONS
+# 2. ANALYTICS & MATH HELPERS
 # ==========================================
 def calculate_xirr(cashflows: list) -> Optional[float]:
+    """Calculates annualized rate (XIRR) given a list of (date, amount) tuples."""
     if len(cashflows) < 2:
         return None
     has_pos = any(amt > 0 for _, amt in cashflows)
@@ -82,9 +89,23 @@ def calculate_xirr(cashflows: list) -> Optional[float]:
     except Exception:
         return None
 
-def get_nifty_benchmark(cashflows: list) -> Optional[float]:
+def calculate_period_return(cashflows: list, start_date: date, end_date: date) -> Optional[float]:
+    """Derives cashflow-aware holding period return (%) over the exact statement duration."""
+    annualized = calculate_xirr(cashflows)
+    if annualized is None:
+        return None
+    days = (end_date - start_date).days
+    if days <= 0:
+        return 0.0
+    r = annualized / 100.0
+    # Compound growth factor over exact fraction of year
+    period_ret = (((1.0 + r) ** (days / 365.0)) - 1.0) * 100.0
+    return min(max(period_ret, -99.99), 100000.0)
+
+def replay_nifty_tri_cashflows(cashflows: list, start_date: date, end_date: date) -> tuple[Optional[float], Optional[float]]:
+    """Replays the exact statement cashflows against Nifty 50 TRI historical data."""
     if not os.path.exists("nifty50_history.json"):
-        raise FileNotFoundError("nifty50_history.json missing")
+        return None, None
     with open("nifty50_history.json", "r") as f:
         nifty_data = json.load(f)
     
@@ -100,7 +121,7 @@ def get_nifty_benchmark(cashflows: list) -> Optional[float]:
             
         nav_date_str = search_date.strftime("%Y-%m-%d")
         if nav_date_str not in nifty_data:
-            return None
+            return None, None
             
         nifty_price = nifty_data[nav_date_str]
         if amount < 0:
@@ -115,15 +136,19 @@ def get_nifty_benchmark(cashflows: list) -> Optional[float]:
             final_value = total_benchmark_units * nifty_price
             benchmark_cashflows.append((dt, final_value))
 
-    return calculate_xirr(benchmark_cashflows)
+    ann_ret = calculate_xirr(benchmark_cashflows)
+    per_ret = calculate_period_return(benchmark_cashflows, start_date, end_date)
+    return per_ret, ann_ret
 
 def normalize_txn_type(tx_desc: str, tx_type_raw: str) -> str:
     desc = (tx_desc or "").upper()
     raw_type = (tx_type_raw or "").upper()
     combined = f"{desc} {raw_type}"
     
-    if "REINVESTMENT" in combined or "DIVIDEND" in combined:
+    if "REINVESTMENT" in combined:
         return "DIVIDEND_REINVESTMENT"
+    if "DIVIDEND" in combined and ("PAYOUT" in combined or "ISSUED" in combined or "TRANSFER" in combined):
+        return "DIVIDEND_PAYOUT"
     if "SIP" in combined:
         return "SIP"
     if "SWP" in combined:
@@ -139,10 +164,8 @@ def normalize_txn_type(tx_desc: str, tx_type_raw: str) -> str:
     return raw_type
 
 async def fetch_amfi_nav_async(client: httpx.AsyncClient, amfi_code: str, target_date: date, cache: dict) -> Optional[float]:
-    """Asynchronous fetcher with request-scoped memoization caching."""
     if not amfi_code:
         return None
-    
     cache_key = (str(amfi_code), target_date.strftime("%Y-%m-%d"))
     if cache_key in cache:
         return cache[cache_key]
@@ -162,11 +185,11 @@ async def fetch_amfi_nav_async(client: httpx.AsyncClient, amfi_code: str, target
                     cache[cache_key] = val
                     return val
             search_date -= timedelta(days=1)
-    except Exception as e:
-        if DEBUG_LOGGING: print(f"AMFI API error for {amfi_code}: {e}")
+    except Exception:
+        pass
     return None
 
-async def resolve_opening_value_async(scheme: dict, stmt_from: date, scheme_name: str, client: httpx.AsyncClient, cache: dict) -> tuple[Optional[float], str]:
+async def resolve_opening_market_value(scheme: dict, stmt_from: date, scheme_name: str, client: httpx.AsyncClient, cache: dict) -> tuple[Optional[float], str]:
     opening_units = scheme.get('open', 0.0)
     if opening_units == 0.0:
         return 0.0, "Zero opening units"
@@ -190,11 +213,12 @@ async def resolve_opening_value_async(scheme: dict, stmt_from: date, scheme_name
         if tx_nav is not None and float(tx_nav) > 0:
             return opening_units * float(tx_nav), "Resolved via earliest transaction NAV proxy"
 
-    return None, "Opening market value unavailable"
+    # Strict compliance rule: Report as unresolved rather than fabricating values
+    return None, "Opening market value unavailable with mathematical certainty"
 
 
 # ==========================================
-# 3. MAIN API ENDPOINT
+# 3. MAIN ANALYTICS ENDPOINT
 # ==========================================
 @app.post("/api/v1/parse-cas", response_model=CASResponse)
 async def parse_cas_file(file: UploadFile = File(...), password: str = Form("")):
@@ -216,17 +240,18 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
         else:
             stmt_to = raw_to
             
-        portfolio_opening = 0.0
-        portfolio_investments = 0.0
-        portfolio_redemptions = 0.0
-        portfolio_current = 0.0
-        
         total_funds_count = 0
         resolved_funds_count = 0
         resolved_current_value = 0.0
+        portfolio_current_value = 0.0
+        
+        total_portfolio_investments = 0.0
+        total_portfolio_redemptions = 0.0
+        total_portfolio_dividends = 0.0
+        portfolio_opening_val = 0.0
         
         funds_breakdown_list = []
-        resolved_xirr_cashflows = []
+        resolved_portfolio_cashflows = []
         all_transactions = []
         amfi_request_cache = {}
 
@@ -235,23 +260,27 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                 for scheme in folio.get('schemes', []):
                     total_funds_count += 1
                     scheme_name = scheme.get('scheme', 'Unknown Scheme')
-                    current_value = scheme.get('valuation', {}).get('value', 0.0)
+                    ending_market_value = scheme.get('valuation', {}).get('value', 0.0)
                     units = scheme.get('valuation', {}).get('balance', 0.0)
                     latest_nav = scheme.get('valuation', {}).get('nav', 0.0)
                     
-                    opening_value, resolution_path = await resolve_opening_value_async(scheme, stmt_from, scheme_name, client, amfi_request_cache)
+                    opening_market_value, resolution_path = await resolve_opening_market_value(scheme, stmt_from, scheme_name, client, amfi_request_cache)
                     
-                    fund_investments = 0.0
-                    fund_redemptions = 0.0
-                    fund_xirr_cashflows = []
+                    statement_investments = 0.0
+                    statement_redemptions = 0.0
+                    dividend_payouts = 0.0
+                    fund_cashflows = []
                     
-                    is_resolved = opening_value is not None
+                    is_resolved = opening_market_value is not None
+                    
                     if is_resolved:
                         resolved_funds_count += 1
-                        resolved_current_value += current_value
-                        if opening_value > 0:
-                            fund_xirr_cashflows.append((stmt_from - timedelta(days=1), -opening_value))
-                            resolved_xirr_cashflows.append((stmt_from - timedelta(days=1), -opening_value))
+                        resolved_current_value += ending_market_value
+                        if opening_market_value > 0:
+                            # Opening market value acts as initial negative cashflow on day prior to statement start
+                            fund_cashflows.append((stmt_from - timedelta(days=1), -opening_market_value))
+                            resolved_portfolio_cashflows.append((stmt_from - timedelta(days=1), -opening_market_value))
+                            portfolio_opening_val += opening_market_value
 
                     for tx in scheme.get('transactions', []):
                         tx_date_str = tx['date']
@@ -274,50 +303,63 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                         all_transactions.append(tx)
                         
                         if tx_type in ['PURCHASE', 'SIP', 'SWITCH_IN']:
-                            fund_investments += tx_amt
+                            statement_investments += tx_amt
                             if is_resolved:
-                                resolved_xirr_cashflows.append((tx_date, -tx_amt))
+                                fund_cashflows.append((tx_date, -tx_amt))
+                                resolved_portfolio_cashflows.append((tx_date, -tx_amt))
                         elif tx_type in ['REDEMPTION', 'SWP', 'SWITCH_OUT']:
-                            fund_redemptions += tx_amt
+                            statement_redemptions += tx_amt
                             if is_resolved:
-                                resolved_xirr_cashflows.append((tx_date, tx_amt))
+                                fund_cashflows.append((tx_date, tx_amt))
+                                resolved_portfolio_cashflows.append((tx_date, tx_amt))
+                        elif tx_type == 'DIVIDEND_PAYOUT':
+                            dividend_payouts += tx_amt
+                            if is_resolved:
+                                fund_cashflows.append((tx_date, tx_amt))
+                                resolved_portfolio_cashflows.append((tx_date, tx_amt))
 
                     if is_resolved:
-                        capital_deployed = opening_value + fund_investments - fund_redemptions
-                        absolute_profit = current_value - capital_deployed
-                        absolute_return_pct = (absolute_profit / capital_deployed * 100) if capital_deployed > 0 else 0.0
-                        fund_xirr_cashflows.append((stmt_to, current_value))
-                        statement_annualized_return = calculate_xirr(fund_xirr_cashflows)
+                        # Final evaluation cashflow on statement end date
+                        fund_cashflows.append((stmt_to, ending_market_value))
                         
-                        portfolio_opening += opening_value
-                        portfolio_investments += fund_investments
-                        portfolio_redemptions += fund_redemptions
+                        net_wealth_gain = (ending_market_value + statement_redemptions + dividend_payouts) - (opening_market_value + statement_investments)
+                        statement_return_pct = calculate_period_return(fund_cashflows, stmt_from, stmt_to)
+                        statement_annualized_return = calculate_xirr(fund_cashflows)
+                        
+                        nifty_per_ret, nifty_ann_ret = replay_nifty_tri_cashflows(fund_cashflows, stmt_from, stmt_to)
+                        
+                        total_portfolio_investments += statement_investments
+                        total_portfolio_redemptions += statement_redemptions
+                        total_portfolio_dividends += dividend_payouts
                     else:
-                        capital_deployed = None
-                        absolute_profit = None
-                        absolute_return_pct = None
+                        net_wealth_gain = None
+                        statement_return_pct = None
                         statement_annualized_return = None
+                        nifty_per_ret = None
+                        nifty_ann_ret = None
 
-                    portfolio_current += current_value
-                    is_fully_redeemed = True if (units == 0.0 or current_value == 0.0) else False
+                    portfolio_current_value += ending_market_value
+                    is_fully_redeemed = True if (units == 0.0 or ending_market_value == 0.0) else False
 
                     funds_breakdown_list.append(FundBreakdown(
                         scheme_name=scheme_name,
-                        opening_value=opening_value,
-                        fund_investments=fund_investments,
-                        fund_redemptions=fund_redemptions,
-                        capital_deployed=capital_deployed,
-                        current_value=current_value,
+                        opening_market_value=opening_market_value,
+                        statement_investments=statement_investments,
+                        statement_redemptions=statement_redemptions,
+                        dividend_payouts=dividend_payouts,
+                        ending_market_value=ending_market_value,
                         units=units,
                         latest_nav=latest_nav,
-                        absolute_profit=absolute_profit,
-                        absolute_return_pct=absolute_return_pct,
+                        net_wealth_gain=net_wealth_gain,
+                        statement_return_pct=statement_return_pct,
                         statement_annualized_return=statement_annualized_return,
+                        nifty_statement_return_pct=nifty_per_ret,
+                        nifty_annualized_return=nifty_ann_ret,
                         resolution_path=resolution_path,
                         is_fully_redeemed=is_fully_redeemed
                     ))
 
-        coverage_percentage = (resolved_current_value / portfolio_current * 100) if portfolio_current > 0 else 0.0
+        coverage_percentage = (resolved_current_value / portfolio_current_value * 100) if portfolio_current_value > 0 else 0.0
         if resolved_funds_count == total_funds_count:
             quality_status = "complete"
         elif resolved_funds_count > 0:
@@ -332,30 +374,38 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
             coverage_percentage=round(coverage_percentage, 2)
         )
 
-        total_capital_deployed = (portfolio_opening + portfolio_investments - portfolio_redemptions) if resolved_funds_count > 0 else None
-        total_profit = (resolved_current_value - total_capital_deployed) if total_capital_deployed is not None else None
-        
-        resolved_xirr_cashflows.append((stmt_to, resolved_current_value))
-        portfolio_annualized_return = calculate_xirr(resolved_xirr_cashflows) if resolved_funds_count > 0 else None
-        
-        benchmark_annualized_return = None
+        if resolved_funds_count > 0:
+            resolved_portfolio_cashflows.append((stmt_to, resolved_current_value))
+            portfolio_net_wealth_gain = (resolved_current_value + total_portfolio_redemptions + total_portfolio_dividends) - (portfolio_opening_val + total_portfolio_investments)
+            portfolio_statement_return = calculate_period_return(resolved_portfolio_cashflows, stmt_from, stmt_to)
+            portfolio_annualized_return = calculate_xirr(resolved_portfolio_cashflows)
+            nifty_port_per, nifty_port_ann = replay_nifty_tri_cashflows(resolved_portfolio_cashflows, stmt_from, stmt_to)
+        else:
+            portfolio_net_wealth_gain = None
+            portfolio_statement_return = None
+            portfolio_annualized_return = None
+            nifty_port_per = None
+            nifty_port_ann = None
+
         benchmark_status = "Available"
         try:
-            if resolved_funds_count > 0:
-                benchmark_annualized_return = get_nifty_benchmark(resolved_xirr_cashflows)
-            else:
+            if resolved_funds_count == 0:
                 benchmark_status = "Unavailable: No resolved funds for benchmark mapping"
         except Exception as e:
             benchmark_status = f"Unavailable: {str(e)}"
 
         portfolio_summary = PortfolioSummary(
             statement_period={"from": str(stmt_from), "to": str(stmt_to)},
-            opening_portfolio_value=portfolio_opening if resolved_funds_count > 0 else None,
-            total_capital_deployed=total_capital_deployed,
-            current_portfolio_value=portfolio_current,
-            total_profit=total_profit,
+            opening_portfolio_value=portfolio_opening_val if resolved_funds_count > 0 else None,
+            total_statement_investments=total_portfolio_investments,
+            total_statement_redemptions=total_portfolio_redemptions,
+            total_dividend_payouts=total_portfolio_dividends,
+            ending_portfolio_value=portfolio_current_value,
+            net_wealth_gain=portfolio_net_wealth_gain,
+            statement_return_pct=portfolio_statement_return,
             statement_annualized_return=portfolio_annualized_return,
-            benchmark_annualized_return=benchmark_annualized_return,
+            nifty_statement_return_pct=nifty_port_per,
+            nifty_annualized_return=nifty_port_ann,
             benchmark_status=benchmark_status,
             data_quality=data_quality
         )
