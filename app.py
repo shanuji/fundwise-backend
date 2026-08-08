@@ -224,7 +224,7 @@ async def resolve_opening_market_value(scheme: dict, stmt_from: date, scheme_nam
 
 
 # ==========================================
-# 3. MAIN ANALYTICS ENDPOINT WITH DIAGNOSTICS
+# 3. MAIN ANALYTICS ENDPOINT 
 # ==========================================
 @app.post("/api/v1/parse-cas", response_model=CASResponse)
 async def parse_cas_file(file: UploadFile = File(...), password: str = Form("")):
@@ -285,21 +285,6 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                     units = to_float(scheme.get('valuation', {}).get('balance', 0.0))
                     latest_nav = to_float(scheme.get('valuation', {}).get('nav', 0.0))
                     
-                    # ==========================================
-                    # CHECKPOINT 1: casparser Extraction Log
-                    # ==========================================
-                    print("======== FUND TRIALS (CHECKPOINT 1) ========")
-                    print(f"Scheme name: {scheme_name}")
-                    print(f"Opening units: {scheme.get('open')}")
-                    print(f"Opening NAV: {scheme.get('open_nav')}")
-                    print(f"Opening market value: {scheme.get('opening_value')}")
-                    print(f"Closing units: {units}")
-                    print(f"Closing NAV: {latest_nav}")
-                    print(f"Closing market value: {ending_market_value}")
-                    print(f"AMFI code: {scheme.get('amfi')}")
-                    print(f"Transaction count: {len(scheme.get('transactions', []))}")
-                    print("============================================")
-
                     opening_market_value, resolution_path = await resolve_opening_market_value(scheme, stmt_from, scheme_name, client, amfi_request_cache)
                     
                     statement_investments = 0.0
@@ -378,19 +363,19 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                         nifty_ann_ret = None
 
                     # ==========================================
-                    # CHECKPOINT 2: Analytics Output Log
+                    # DIAGNOSTICS: PERIOD VS ANNUALIZED MATH
                     # ==========================================
-                    print(f"======== FUND CALCULATIONS (CHECKPOINT 2): {scheme_name} =======")
+                    days_in_period = (stmt_to - stmt_from).days
+                    print(f"======== RETURN MATH DIAGNOSTICS: {scheme_name} ========")
                     print(f"Opening Market Value : {opening_market_value}")
                     print(f"Statement Investments: {statement_investments}")
                     print(f"Statement Redemptions: {statement_redemptions}")
-                    print(f"Dividend Payouts     : {dividend_payouts}")
                     print(f"Ending Market Value  : {ending_market_value}")
-                    print(f"Net Wealth Gain      : {net_wealth_gain}")
-                    print(f"Statement Return     : {statement_return_pct}")
-                    print(f"Annualized Return    : {statement_annualized_return}")
-                    print(f"Nifty Statement Return: {nifty_per_ret}")
-                    print("----------------------------------------------------------------\n")
+                    print(f"Statement Period     : {stmt_from} to {stmt_to} ({days_in_period} days)")
+                    print(f"Exact Cashflows      : {fund_cashflows}")
+                    print(f"Calculated Period Ret (statement_return_pct): {statement_return_pct}")
+                    print(f"Calculated Ann Ret (statement_annualized_return): {statement_annualized_return}")
+                    print("========================================================\n")
 
                     portfolio_current_value += ending_market_value
                     is_fully_redeemed = True if (units == 0.0 or ending_market_value == 0.0) else False
@@ -471,20 +456,16 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
         )
 
         # ==========================================
-        # CHECKPOINT 3: API Response JSON & Keys Log (Resilient)
+        # DIAGNOSTICS: RAW JSON VALUES
         # ==========================================
         payload = response_obj.model_dump()
-        print("========== CHECKPOINT 3: API RESPONSE ==========")
-        print("Top-level keys:", list(payload.keys()))
-        if "portfolio_summary" in payload:
-            print("Portfolio keys:", list(payload["portfolio_summary"].keys()))
+        print("========== JSON RETURN VALUES ==========")
         if payload.get("funds_breakdown"):
-            print("Fund keys:", list(payload["funds_breakdown"][0].keys()))
-            print("Sample fund:", json.dumps(payload["funds_breakdown"][0], indent=2, default=str))
-        else:
-            print("No funds returned.")
-        print(json.dumps(payload, indent=2, default=str))
-        print("================================================")
+            for f in payload["funds_breakdown"]:
+                print(f"Fund: {f['scheme_name']}")
+                print(f"  -> statement_return_pct JSON: {f['statement_return_pct']}")
+                print(f"  -> statement_annualized_return JSON: {f['statement_annualized_return']}")
+        print("========================================\n")
 
         return response_obj
 
