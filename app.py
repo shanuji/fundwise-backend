@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -11,6 +12,7 @@ import os
 import uuid
 import httpx
 from collections import defaultdict
+import traceback
 
 app = FastAPI(title="FundWise Analytics Engine")
 
@@ -536,7 +538,11 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
         return response_obj
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=400,
+            content={"message": str(e), "detail": str(e)}
+        )
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
