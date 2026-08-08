@@ -8,6 +8,7 @@ import casparser
 from pyxirr import xirr
 import json
 import os
+import uuid
 import httpx
 from collections import defaultdict
 
@@ -85,17 +86,27 @@ def to_float(val, default=0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-def parse_statement_date(date_str: str, default: date) -> date:
-    """Parse DD-MMM-YYYY or fallback formats without hardcoded silent dates."""
+def parse_statement_date(date_str: str) -> date:
     if not date_str:
-        return default
+        raise ValueError("Statement date is missing.")
     date_str_clean = str(date_str).strip()
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%b %Y"):
+    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%b %Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(date_str_clean, fmt).date()
         except ValueError:
             continue
-    return default
+    raise ValueError(f"Unable to parse statement date explicitly: {date_str}")
+
+def parse_tx_date(date_str: str) -> date:
+    if not date_str:
+        raise ValueError("Transaction date is missing.")
+    date_str_clean = str(date_str).strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(date_str_clean, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unable to parse transaction date explicitly: {date_str}")
 
 def calculate_xirr(cashflows: list) -> Optional[float]:
     if len(cashflows) < 2:
@@ -174,29 +185,33 @@ def normalize_txn_type(tx_desc: str, tx_type_raw: str) -> str:
     desc = (tx_desc or "").upper()
     raw_type = (tx_type_raw or "").upper()
     combined = f"{desc} {raw_type}"
+    tokens = set(combined.split())
     
-    if "STAMP DUTY" in combined:
+    if "STAMP" in combined and "DUTY" in combined:
         return "STAMP_DUTY"
     if "REINVESTMENT" in combined:
         return "DIVIDEND_REINVESTMENT"
     if "DIVIDEND" in combined and ("PAYOUT" in combined or "ISSUED" in combined or "TRANSFER" in combined):
         return "DIVIDEND_PAYOUT"
-    if "LATERAL SHIFT IN" in combined or "SWITCH IN" in combined or "SIP" in combined:
-        if "LATERAL SHIFT IN" in combined:
+    if "LATERAL" in combined and "SHIFT" in combined:
+        if "IN" in tokens:
             return "SWITCH_IN"
-        if "SIP" in combined:
-            return "SIP"
-        return "SWITCH_IN"
-    if "LATERAL SHIFT OUT" in combined or "SWITCH OUT" in combined or "SWP" in combined:
-        if "LATERAL SHIFT OUT" in combined:
+        if "OUT" in tokens:
             return "SWITCH_OUT"
-        if "SWP" in combined:
-            return "SWP"
-        return "SWITCH_OUT"
-    if "SYSTEMATIC TRANSFER PLAN" in combined or "STP" in combined:
-        return "SWITCH_IN" if ("IN" in combined or "PURCHASE" in combined) else "SWITCH_OUT"
+    if "SIP" in tokens:
+        return "SIP"
+    if "SWP" in tokens:
+        return "SWP"
+    if "SYSTEMATIC" in combined and "TRANSFER" in combined or "STP" in tokens:
+        if "IN" in tokens or "PURCHASE" in tokens:
+            return "SWITCH_IN"
+        if "OUT" in tokens or "REDEMPTION" in tokens or "SELL" in tokens:
+            return "SWITCH_OUT"
     if "SWITCH" in combined:
-        return "SWITCH_IN" if "IN" in combined else "SWITCH_OUT"
+        if "IN" in tokens:
+            return "SWITCH_IN"
+        if "OUT" in tokens:
+            return "SWITCH_OUT"
     if "PURCHASE" in combined or "LUMPSUM" in combined or "ADDITIONAL" in combined:
         return "PURCHASE"
     if "REDEMPTION" in combined or "SELL" in combined:
@@ -256,7 +271,8 @@ async def resolve_opening_market_value(scheme: dict, stmt_from: date, scheme_nam
 # ==========================================
 @app.post("/api/v1/parse-cas", response_model=CASResponse)
 async def parse_cas_file(file: UploadFile = File(...), password: str = Form("")):
-    temp_path = f"/tmp/{file.filename}"
+    sanitized_filename = f"{uuid.uuid4()}_{os.path.basename(file.filename or 'statement.pdf')}"
+    temp_path = os.path.join("/tmp", sanitized_filename)
     try:
         with open(temp_path, "wb") as f:
             f.write(await file.read())
@@ -265,11 +281,15 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
         parsed_data = raw_parsed if isinstance(raw_parsed, dict) else raw_parsed.model_dump()
         
         raw_period = parsed_data.get('statement_period', {})
-        from_val = raw_period.get('from') or raw_period.get('start_date') or "01-Apr-2026"
-        stmt_from = parse_statement_date(from_val, date(2026, 4, 1))
+        from_val = raw_period.get('from') or raw_period.get('start_date')
+        if not from_val:
+            raise HTTPException(status_code=400, detail="Statement start date missing from CAS data.")
+        stmt_from = parse_statement_date(from_val)
             
-        to_val = raw_period.get('to') or raw_period.get('end_date') or "05-Aug-2026"
-        stmt_to = parse_statement_date(to_val, date(2026, 8, 5))
+        to_val = raw_period.get('to') or raw_period.get('end_date')
+        if not to_val:
+            raise HTTPException(status_code=400, detail="Statement end date missing from CAS data.")
+        stmt_to = parse_statement_date(to_val)
             
         total_funds_count = 0
         resolved_funds_count = 0
@@ -285,6 +305,7 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
         funds_breakdown_list = []
         portfolio_daily_cashflows = defaultdict(float)
         resolved_fund_units = []
+        resolved_valuation_dates = set()
         all_transactions = []
         amfi_request_cache = {}
 
@@ -299,7 +320,7 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                     latest_nav = to_float(valuation_data.get('nav', 0.0))
                     
                     val_date_raw = valuation_data.get('date')
-                    valuation_date = parse_statement_date(val_date_raw, stmt_to)
+                    valuation_date = parse_statement_date(val_date_raw) if val_date_raw else stmt_to
                     
                     opening_market_value, resolution_path = await resolve_opening_market_value(scheme, stmt_from, scheme_name, client, amfi_request_cache)
                     
@@ -315,6 +336,7 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                         resolved_funds_count += 1
                         resolved_current_value += ending_market_value
                         resolved_fund_units.append(units)
+                        resolved_valuation_dates.add(valuation_date)
                         
                         if opening_market_value > 0:
                             open_dt = stmt_from - timedelta(days=1)
@@ -325,8 +347,8 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                     for tx in scheme.get('transactions', []):
                         tx_date_str = tx.get('date')
                         if not tx_date_str:
-                            continue
-                        tx_date = parse_statement_date(tx_date_str, stmt_from)
+                            raise HTTPException(status_code=400, detail=f"Transaction date missing in scheme {scheme_name}")
+                        tx_date = parse_tx_date(tx_date_str)
 
                         if not (stmt_from <= tx_date <= stmt_to):
                             continue
@@ -448,6 +470,10 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
             portfolio_return_status = "Unavailable"
 
         if resolved_funds_count > 0:
+            if len(resolved_valuation_dates) > 1:
+                raise HTTPException(status_code=400, detail="All resolved funds must share the same valuation date for portfolio calculation.")
+            portfolio_valuation_date = list(resolved_valuation_dates)[0] if resolved_valuation_dates else stmt_to
+
             portfolio_transaction_cashflows = []
             for dt in sorted(portfolio_daily_cashflows.keys()):
                 amt = portfolio_daily_cashflows[dt]
@@ -462,13 +488,13 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
             
             portfolio_xirr_cashflows = list(portfolio_transaction_cashflows)
             if not port_is_fully_redeemed:
-                portfolio_xirr_cashflows.append((stmt_to, resolved_current_value))
+                portfolio_xirr_cashflows.append((portfolio_valuation_date, resolved_current_value))
             
             portfolio_net_wealth_gain = (resolved_current_value + total_portfolio_redemptions + total_portfolio_dividends) - (portfolio_opening_val + total_portfolio_investments + total_portfolio_stamp_duty)
             portfolio_statement_return = calculate_period_return(portfolio_xirr_cashflows)
             portfolio_annualized_return = calculate_xirr(portfolio_xirr_cashflows)
             
-            nifty_port_per, nifty_port_ann = replay_nifty_tri_cashflows(portfolio_transaction_cashflows, port_is_fully_redeemed, stmt_to)
+            nifty_port_per, nifty_port_ann = replay_nifty_tri_cashflows(portfolio_transaction_cashflows, port_is_fully_redeemed, portfolio_valuation_date)
         else:
             portfolio_net_wealth_gain = None
             portfolio_statement_return = None
