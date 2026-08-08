@@ -322,7 +322,12 @@ async def parse_cas_file(file: UploadFile = File(...), password: str = Form(""))
                     latest_nav = to_float(valuation_data.get('nav', 0.0))
                     
                     val_date_raw = valuation_data.get('date')
-                    valuation_date = parse_statement_date(val_date_raw) if val_date_raw else stmt_to
+                    if not val_date_raw:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Valuation date missing for scheme: {scheme_name}"
+                        )
+                    valuation_date = parse_statement_date(val_date_raw)
                     
                     opening_market_value, resolution_path = await resolve_opening_market_value(scheme, stmt_from, scheme_name, client, amfi_request_cache)
                     
